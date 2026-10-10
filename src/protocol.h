@@ -35,6 +35,7 @@ typedef enum wup_target_format {
   WUP_FORMAT_FFPFS  = 2,
   WUP_FORMAT_PKG    = 3,
   WUP_FORMAT_FOLDER = 4,
+  WUP_FORMAT_EXFAT  = 5,
 } wup_target_format_t;
 
 typedef struct wup_frame {
