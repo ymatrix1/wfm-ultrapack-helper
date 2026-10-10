@@ -76,6 +76,19 @@ class Client {
   close() { this.sock.destroy(); }
 }
 
+// Decompress a .ffpfsc into the logical (block-padded) inner image.
+function unpfsc(d) {
+  const bs = Number(d.readBigUInt64LE(0x10)), tbl = Number(d.readBigUInt64LE(0x18));
+  const logical = Number(d.readBigUInt64LE(0x28));
+  const parts = [];
+  for (let i = 0; i < logical / bs; i++) {
+    const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
+    const chunk = d.subarray(a, e);
+    parts.push(chunk.length === bs ? chunk : zlib.inflateSync(chunk));
+  }
+  return Buffer.concat(parts);
+}
+
 async function convert(src, dst, fmt, rid = 1) {
   const c = new Client();
   await c.ready();
@@ -327,22 +340,54 @@ async function main() {
       const f = await convert(tree, out, 'ffpfsc', 13);
       assert.strictEqual(f.type, T.DONE, f.payload);
       assert.ok(!fs.existsSync(path.join(out, 'tree.tmp.exfat')), 'temp exfat must be removed');
-      const d = fs.readFileSync(path.join(out, 'tree.ffpfsc'));
-      const bs = Number(d.readBigUInt64LE(0x10)), tbl = Number(d.readBigUInt64LE(0x18));
-      const logical = Number(d.readBigUInt64LE(0x28));
-      const parts = [];
-      for (let i = 0; i < logical / bs; i++) {
-        const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
-        const chunk = d.subarray(a, e);
-        parts.push(chunk.length === bs ? chunk : zlib.inflateSync(chunk));
-      }
       const img = path.join(work, 'inner.exfat');
-      fs.writeFileSync(img, Buffer.concat(parts));
+      fs.writeFileSync(img, unpfsc(fs.readFileSync(path.join(out, 'tree.ffpfsc'))));
       assert.strictEqual(fs.readFileSync(img).toString('ascii', 3, 11), 'EXFAT   ');
       if (haveFsck) {
         const r = sh('fsck.exfat', [img]);
         assert.strictEqual(r.status, 0, r.stdout + r.stderr);
       }
+
+      // Zero-staging: convert a ~200 MB tree while polling the output dir; no *.tmp.exfat may ever appear.
+      const big = path.join(work, 'bigtree');
+      fs.mkdirSync(path.join(big, 'sub'), { recursive: true });
+      const crypto = require('crypto');
+      for (let i = 0; i < 4; i++) {
+        const fd = fs.openSync(path.join(big, i % 2 ? 'sub' : '.', `rand${i}.bin`), 'w');
+        for (let k = 0; k < 25; k++) fs.writeSync(fd, crypto.randomBytes(2 * 1024 * 1024)); // 50 MB random
+        fs.closeSync(fd);
+      }
+      fs.writeFileSync(path.join(big, 'zeros.bin'), Buffer.alloc(1024 * 1024 * 3 + 17));
+      const bigOut = path.join(work, 'bigout');
+      fs.mkdirSync(bigOut);
+      const seen = new Set();
+      let polls = 0;
+      const timer = setInterval(() => {
+        polls++;
+        for (const n of fs.readdirSync(bigOut)) seen.add(n);
+      }, 2);
+      let bf;
+      try { bf = await convert(big, bigOut, 'ffpfsc', 14); } finally { clearInterval(timer); }
+      assert.strictEqual(bf.type, T.DONE, bf.payload);
+      assert.ok(polls > 5, 'poller did not run (' + polls + ')');
+      assert.ok(seen.has('bigtree.ffpfsc'), 'output was never observed: ' + [...seen]);
+      assert.deepStrictEqual([...seen].filter(n => n.endsWith('.tmp.exfat') || n.includes('.tmp')), [], 'staging file appeared');
+      assert.deepStrictEqual(fs.readdirSync(bigOut), ['bigtree.ffpfsc']);
+      fs.rmSync(bigOut, { recursive: true, force: true });
+      fs.rmSync(big, { recursive: true, force: true });
+    });
+    await test('folder -> ffpfsc decompresses byte-identical to folder -> exfat', async () => {
+      const cmp = path.join(work, 'cmpout');
+      fs.mkdirSync(cmp, { recursive: true });
+      const fe = await convert(tree, cmp, 'exfat', 15);
+      assert.strictEqual(fe.type, T.DONE, fe.payload);
+      const ff = await convert(tree, cmp, 'ffpfsc', 16);
+      assert.strictEqual(ff.type, T.DONE, ff.payload);
+      const exfat = fs.readFileSync(path.join(cmp, 'tree.exfat'));
+      const inner = unpfsc(fs.readFileSync(path.join(cmp, 'tree.ffpfsc')));
+      assert.strictEqual(inner.length, Math.ceil(exfat.length / 65536) * 65536);
+      assert.ok(inner.subarray(0, exfat.length).equals(exfat), 'inner image differs from exfat output');
+      assert.ok(inner.subarray(exfat.length).every(x => x === 0), 'padding tail must be zero');
     });
   } finally {
     daemon.kill('SIGKILL');

@@ -17,14 +17,14 @@ Guidelines and architecture instructions for `wfm-ultrapack-helper`.
   - Signal protection: `SIGPIPE` ignored to prevent process crashes on socket drop; `SIGINT`/`SIGTERM` for graceful socket unlink.
   - Logging directed to `/data/wfm/helper.log`.
 - `src/exfat_engine.c` & `src/exfat_engine.h`:
-  - Direct zero-staging exFAT generator.
+  - Direct zero-staging exFAT generator; emits the image in strict offset order through a sink callback (`convert_folder_to_exfat_stream`), with `convert_folder_to_exfat` as the file sink.
   - UTF-8 to UTF-16 conversion for filenames.
   - Up-case table lookup for checksums and name hashing.
   - `lstat` protection against symlink loops, duplicate entry detection, and heap-allocated copy buffers.
 - `src/convert_engine.c` & `src/convert_engine.h`:
   - Streaming PFSC (`.ffpfsc`) 64 KiB zlib compression.
   - State reuse via `deflateReset`.
-  - Two-stage monotonic progress envelope for folder -> exfat -> ffpfsc conversions.
+  - Folder -> ffpfsc is zero-staging: exFAT stream feeds the PFSC encoder directly (no temp image), header/offset table backpatched at the end; single monotonic 0..100% progress.
   - Trailing slash sanitization.
 - `src/miniz.c` & `src/miniz.h`: Standalone amalgamated zlib library.
 - `src/protocol.h`: Wire protocol framing and constants.

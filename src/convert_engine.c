@@ -19,30 +19,75 @@ static void put64_le(uint8_t *p, uint64_t v) {
   put32_le(p + 4, (uint32_t)(v >> 32));
 }
 
-typedef struct progress_envelope {
-  convert_progress_cb user_cb;
-  convert_cancel_cb cancel_cb;
-  void *user_data;
-  double scale;
-  double offset;
-  uint64_t max_total;
-} progress_envelope_t;
-
-static void wrapped_progress(uint64_t total, uint64_t done, void *user_data) {
-  progress_envelope_t *env = (progress_envelope_t *)user_data;
-  if (!env || !env->user_cb) return;
-  uint64_t report_total = env->max_total ? env->max_total : total;
-  double ratio = total ? ((double)done / (double)total) : 0.0;
-  uint64_t report_done = (uint64_t)((env->offset + ratio * env->scale) * (double)report_total);
-  if (report_done > report_total) report_done = report_total;
-  env->user_cb(report_total, report_done, env->user_data);
+static uint64_t pfsc_data_offset(uint32_t block_count) {
+  size_t table_bytes = (size_t)(block_count + 1) * sizeof(uint64_t);
+  uint64_t off = PFSC_INITIAL_DATA_OFFSET;
+  while (off < PFSC_BLOCK_OFFSETS_OFFSET + table_bytes) {
+    off += PFSC_LOGICAL_BLOCK_SIZE;
+  }
+  return off;
 }
 
-/* cancel_cb receives the same user_data as the stage callbacks (the envelope),
- * so forward to the caller's cancel callback with the caller's user_data. */
-static bool wrapped_cancel(void *user_data) {
-  progress_envelope_t *env = (progress_envelope_t *)user_data;
-  return env && env->cancel_cb && env->cancel_cb(env->user_data);
+/* Backpatch PFSC header and block offset table. Returns 0 or -1 (err_msg set). */
+static int pfsc_write_header(FILE *fout, const uint64_t *offsets, uint32_t block_count,
+                             uint64_t initial_data_offset, uint64_t logical_size,
+                             char *err_msg, size_t err_len) {
+  uint8_t hdr[PFSC_HEADER_SIZE];
+  memset(hdr, 0, sizeof(hdr));
+  hdr[0] = 'P'; hdr[1] = 'F'; hdr[2] = 'S'; hdr[3] = 'C'; /* 0x43534650 */
+  hdr[8] = 6;
+  put32_le(hdr + 0x0C, PFSC_LOGICAL_BLOCK_SIZE);
+  put64_le(hdr + 0x10, PFSC_LOGICAL_BLOCK_SIZE);
+  put64_le(hdr + 0x18, PFSC_BLOCK_OFFSETS_OFFSET);
+  put64_le(hdr + 0x20, initial_data_offset);
+  put64_le(hdr + 0x28, logical_size);
+
+  if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
+    snprintf(err_msg, err_len, "Failed writing PFSC header: %s", strerror(errno));
+    return -1;
+  }
+  if (fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET) != 0) {
+    snprintf(err_msg, err_len, "Failed seeking to block offset table: %s", strerror(errno));
+    return -1;
+  }
+  for (uint32_t b = 0; b <= block_count; b++) {
+    uint8_t obuf[8];
+    put64_le(obuf, offsets[b]);
+    if (fwrite(obuf, 1, 8, fout) != 8) {
+      snprintf(err_msg, err_len, "Failed writing offset table: %s", strerror(errno));
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Compress one full 64 KiB logical block (reusing strm) and write it; advances *out_off. */
+static int pfsc_emit_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_buf,
+                           FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+  deflateReset(strm);
+  strm->avail_in = PFSC_LOGICAL_BLOCK_SIZE;
+  strm->next_in = (Bytef *)in_buf;
+  strm->avail_out = PFSC_LOGICAL_BLOCK_SIZE * 2;
+  strm->next_out = out_buf;
+
+  int ret = deflate(strm, Z_FINISH);
+  size_t comp_sz = (PFSC_LOGICAL_BLOCK_SIZE * 2) - strm->avail_out;
+
+  if (ret != Z_STREAM_END || comp_sz >= PFSC_LOGICAL_BLOCK_SIZE) {
+    /* Store uncompressed block directly as a full 64 KiB block */
+    if (fwrite(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fout) != PFSC_LOGICAL_BLOCK_SIZE) {
+      snprintf(err_msg, err_len, "Failed writing block to disk (disk full?): %s", strerror(errno));
+      return -1;
+    }
+    *out_off += PFSC_LOGICAL_BLOCK_SIZE;
+  } else {
+    if (fwrite(out_buf, 1, comp_sz, fout) != comp_sz) {
+      snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
+      return -1;
+    }
+    *out_off += comp_sz;
+  }
+  return 0;
 }
 
 int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_path,
@@ -72,11 +117,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   uint64_t logical_size = (uint64_t)block_count * PFSC_LOGICAL_BLOCK_SIZE;
 
   /* Dynamically size initial data offset so table never overflows */
-  size_t table_bytes = (size_t)(block_count + 1) * sizeof(uint64_t);
-  uint64_t initial_data_offset = PFSC_INITIAL_DATA_OFFSET;
-  while (initial_data_offset < PFSC_BLOCK_OFFSETS_OFFSET + table_bytes) {
-    initial_data_offset += PFSC_LOGICAL_BLOCK_SIZE;
-  }
+  uint64_t initial_data_offset = pfsc_data_offset(block_count);
 
   FILE *fout = fopen(out_ffpfsc_path, "wb+");
   if (!fout) {
@@ -153,31 +194,9 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
     offsets[b] = current_out_offset;
 
-    /* Reuse z_stream via deflateReset */
-    deflateReset(&strm);
-    strm.avail_in = PFSC_LOGICAL_BLOCK_SIZE;
-    strm.next_in = in_buf;
-    strm.avail_out = PFSC_LOGICAL_BLOCK_SIZE * 2;
-    strm.next_out = out_buf;
-
-    int ret = deflate(&strm, Z_FINISH);
-    size_t comp_sz = (PFSC_LOGICAL_BLOCK_SIZE * 2) - strm.avail_out;
-
-    if (ret != Z_STREAM_END || comp_sz >= PFSC_LOGICAL_BLOCK_SIZE) {
-      /* Store uncompressed block directly as a full 64 KiB block */
-      if (fwrite(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fout) != PFSC_LOGICAL_BLOCK_SIZE) {
-        snprintf(err_msg, err_len, "Failed writing block to disk (disk full?): %s", strerror(errno));
-        convert_res = -1;
-        break;
-      }
-      current_out_offset += PFSC_LOGICAL_BLOCK_SIZE;
-    } else {
-      if (fwrite(out_buf, 1, comp_sz, fout) != comp_sz) {
-        snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
-        convert_res = -1;
-        break;
-      }
-      current_out_offset += comp_sz;
+    if (pfsc_emit_block(&strm, in_buf, out_buf, fout, &current_out_offset, err_msg, err_len) != 0) {
+      convert_res = -1;
+      break;
     }
 
     processed_in += nread;
@@ -196,40 +215,10 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
   offsets[block_count] = current_out_offset;
 
-  /* 2. Write Header at offset 0 (little-endian explicit) */
-  uint8_t hdr[PFSC_HEADER_SIZE];
-  memset(hdr, 0, sizeof(hdr));
-  hdr[0] = 'P'; hdr[1] = 'F'; hdr[2] = 'S'; hdr[3] = 'C'; /* 0x43534650 */
-  hdr[8] = 6;
-  put32_le(hdr + 0x0C, PFSC_LOGICAL_BLOCK_SIZE);
-  put64_le(hdr + 0x10, PFSC_LOGICAL_BLOCK_SIZE);
-  put64_le(hdr + 0x18, PFSC_BLOCK_OFFSETS_OFFSET);
-  put64_le(hdr + 0x20, initial_data_offset);
-  put64_le(hdr + 0x28, logical_size);
-
-  if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
-    snprintf(err_msg, err_len, "Failed writing PFSC header: %s", strerror(errno));
+  if (pfsc_write_header(fout, offsets, block_count, initial_data_offset, logical_size, err_msg, err_len) != 0) {
     free(offsets); fclose(fin); fclose(fout);
     unlink(out_ffpfsc_path);
     return -1;
-  }
-
-  /* 3. Write Offset Table starting at 0x400 */
-  if (fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET) != 0) {
-    snprintf(err_msg, err_len, "Failed seeking to block offset table: %s", strerror(errno));
-    free(offsets); fclose(fin); fclose(fout);
-    unlink(out_ffpfsc_path);
-    return -1;
-  }
-  for (uint32_t b = 0; b <= block_count; b++) {
-    uint8_t obuf[8];
-    put64_le(obuf, offsets[b]);
-    if (fwrite(obuf, 1, 8, fout) != 8) {
-      snprintf(err_msg, err_len, "Failed writing offset table: %s", strerror(errno));
-      free(offsets); fclose(fin); fclose(fout);
-      unlink(out_ffpfsc_path);
-      return -1;
-    }
   }
 
   free(offsets);
@@ -239,6 +228,150 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     unlink(out_ffpfsc_path);
     return -1;
   }
+  return 0;
+}
+
+typedef struct {
+  FILE *f;
+  uint8_t *in_buf;
+  uint8_t *out_buf;
+  uint64_t *offsets;
+  size_t fill;
+  uint32_t block_count;
+  uint32_t next_block;
+  uint64_t total_bytes;
+  uint64_t initial_data_offset;
+  uint64_t cur_off;
+  uint64_t logical_size;
+  z_stream strm;
+  bool zinit;
+  char err[256];
+} pfsc_sink_t;
+
+static void pfsc_sink_free(pfsc_sink_t *s) {
+  if (s->zinit) deflateEnd(&s->strm);
+  s->zinit = false;
+  free(s->in_buf); free(s->out_buf); free(s->offsets);
+  s->in_buf = s->out_buf = NULL;
+  s->offsets = NULL;
+}
+
+/* Called once with the exact image size: reserves header area and allocates state. */
+static int pfsc_sink_begin(uint64_t total_bytes, void *ctx) {
+  pfsc_sink_t *s = (pfsc_sink_t *)ctx;
+  if (total_bytes == 0) {
+    snprintf(s->err, sizeof(s->err), "Generated image is empty (0 bytes)");
+    return -1;
+  }
+  s->total_bytes = total_bytes;
+  s->block_count = (uint32_t)((total_bytes + PFSC_LOGICAL_BLOCK_SIZE - 1) / PFSC_LOGICAL_BLOCK_SIZE);
+  s->logical_size = (uint64_t)s->block_count * PFSC_LOGICAL_BLOCK_SIZE;
+  s->initial_data_offset = pfsc_data_offset(s->block_count);
+  s->cur_off = s->initial_data_offset;
+
+  s->offsets = (uint64_t *)calloc((size_t)s->block_count + 1, sizeof(uint64_t));
+  s->in_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE);
+  s->out_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE * 2);
+  if (!s->offsets || !s->in_buf || !s->out_buf) {
+    snprintf(s->err, sizeof(s->err), "Out of memory for PFSC buffers (%u blocks)", s->block_count);
+    return -1;
+  }
+  memset(&s->strm, 0, sizeof(s->strm));
+  if (deflateInit(&s->strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
+    snprintf(s->err, sizeof(s->err), "deflateInit failed");
+    return -1;
+  }
+  s->zinit = true;
+
+  uint8_t zero_buf[4096] = {0};
+  uint64_t pad = s->initial_data_offset;
+  while (pad > 0) {
+    size_t p = (pad > sizeof(zero_buf)) ? sizeof(zero_buf) : (size_t)pad;
+    if (fwrite(zero_buf, 1, p, s->f) != p) {
+      snprintf(s->err, sizeof(s->err), "Failed writing header padding: %s", strerror(errno));
+      return -1;
+    }
+    pad -= p;
+  }
+  return 0;
+}
+
+static int pfsc_sink_flush_block(pfsc_sink_t *s) {
+  if (s->next_block >= s->block_count) {
+    snprintf(s->err, sizeof(s->err), "Image larger than declared size");
+    return -1;
+  }
+  s->offsets[s->next_block] = s->cur_off;
+  if (pfsc_emit_block(&s->strm, s->in_buf, s->out_buf, s->f, &s->cur_off, s->err, sizeof(s->err)) != 0) {
+    return -1;
+  }
+  s->next_block++;
+  s->fill = 0;
+  return 0;
+}
+
+static int pfsc_sink_write(const void *buf, size_t len, void *ctx) {
+  pfsc_sink_t *s = (pfsc_sink_t *)ctx;
+  const uint8_t *p = (const uint8_t *)buf;
+  while (len > 0) {
+    size_t room = PFSC_LOGICAL_BLOCK_SIZE - s->fill;
+    size_t n = (len < room) ? len : room;
+    memcpy(s->in_buf + s->fill, p, n);
+    s->fill += n; p += n; len -= n;
+    if (s->fill == PFSC_LOGICAL_BLOCK_SIZE && pfsc_sink_flush_block(s) != 0) return -1;
+  }
+  return 0;
+}
+
+/* Zero-pad and flush the last partial block, then backpatch header + offset table. */
+static int pfsc_sink_finish(pfsc_sink_t *s) {
+  if (s->fill > 0) {
+    memset(s->in_buf + s->fill, 0, PFSC_LOGICAL_BLOCK_SIZE - s->fill);
+    if (pfsc_sink_flush_block(s) != 0) return -1;
+  }
+  if (s->next_block != s->block_count) {
+    snprintf(s->err, sizeof(s->err), "Image shorter than declared size (%u of %u blocks)",
+             s->next_block, s->block_count);
+    return -1;
+  }
+  s->offsets[s->block_count] = s->cur_off;
+  return pfsc_write_header(s->f, s->offsets, s->block_count, s->initial_data_offset,
+                           s->logical_size, s->err, sizeof(s->err));
+}
+
+/* Folder -> .ffpfsc with no staging image: exFAT chunks stream straight into the PFSC encoder. */
+static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpfsc_path,
+                                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                    void *user_data, char *err_msg, size_t err_len) {
+  pfsc_sink_t *s = (pfsc_sink_t *)calloc(1, sizeof(*s));
+  if (!s) {
+    snprintf(err_msg, err_len, "Out of memory");
+    return -1;
+  }
+  s->f = fopen(out_ffpfsc_path, "wb+");
+  if (!s->f) {
+    snprintf(err_msg, err_len, "Cannot create target .ffpfsc: %s", strerror(errno));
+    free(s);
+    return -1;
+  }
+
+  int ret = convert_folder_to_exfat_stream(source_dir, pfsc_sink_begin, pfsc_sink_write, s,
+                                           progress_cb, cancel_cb, user_data, err_msg, err_len);
+  if (ret == 0 && pfsc_sink_finish(s) != 0) ret = -1;
+  if (ret == -1 && s->err[0]) snprintf(err_msg, err_len, "%s", s->err);
+  uint64_t total = s->total_bytes;
+  pfsc_sink_free(s);
+  int close_rc = fclose(s->f);
+  if (ret == 0 && close_rc != 0) {
+    snprintf(err_msg, err_len, "Failed flushing output file: %s", strerror(errno));
+    ret = -1;
+  }
+  free(s);
+  if (ret != 0) {
+    unlink(out_ffpfsc_path);
+    return ret;
+  }
+  if (progress_cb) progress_cb(total, total, user_data);
   return 0;
 }
 
@@ -297,23 +430,9 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
       return convert_folder_to_exfat(sanitized_source, target_file, progress_cb, cancel_cb,
                                      user_data, err_msg, err_len);
     } else {
-      /* Folder -> .ffpfsc: 2-stage conversion with monotonic progress envelope (0..50%, 50..100%) */
-      char temp_exfat[4096];
-      snprintf(temp_exfat, sizeof(temp_exfat), "%s/%s.tmp.exfat", dest_path, clean_name);
-
-      progress_envelope_t stage1_env = { progress_cb, cancel_cb, user_data, 0.50, 0.00, 1000000 };
-      int ret = convert_folder_to_exfat(sanitized_source, temp_exfat, wrapped_progress, wrapped_cancel,
-                                        &stage1_env, err_msg, err_len);
-      if (ret != 0) {
-        unlink(temp_exfat);
-        return ret;
-      }
-
-      progress_envelope_t stage2_env = { progress_cb, cancel_cb, user_data, 0.50, 0.50, 1000000 };
-      ret = convert_image_to_ffpfsc(temp_exfat, target_file, wrapped_progress, wrapped_cancel,
-                                    &stage2_env, err_msg, err_len);
-      unlink(temp_exfat);
-      return ret;
+      /* Folder -> .ffpfsc: zero-staging, exFAT stream feeds the PFSC encoder directly */
+      return convert_folder_to_ffpfsc(sanitized_source, target_file, progress_cb, cancel_cb,
+                                      user_data, err_msg, err_len);
     }
   } else {
     /* If source is an exfat/raw image file and target is ffpfsc */
