@@ -536,6 +536,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     return -1;
   }
   s->f = fopen(out_ffpfsc_path, "wb+");
+  if (s->f) setvbuf(s->f, NULL, _IOFBF, (size_t)8 << 20); /* big sequential writes: the console drive is slow with small ones */
   if (!s->f) {
     snprintf(err_msg, err_len, "Cannot create target .ffpfsc: %s", strerror(errno));
     free(s); free(chunk); fclose(fin);
@@ -608,6 +609,7 @@ static int stream_to_ffpfsc(const char *out_ffpfsc_path, ffpfsc_stream_fn run, v
     return -1;
   }
   s->f = fopen(out_ffpfsc_path, "wb+");
+  if (s->f) setvbuf(s->f, NULL, _IOFBF, (size_t)8 << 20); /* big sequential writes: the console drive is slow with small ones */
   if (!s->f) {
     snprintf(err_msg, err_len, "Cannot create target .ffpfsc: %s", strerror(errno));
     free(s);
