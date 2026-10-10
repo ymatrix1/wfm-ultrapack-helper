@@ -4,7 +4,7 @@
   "description": "Standalone high-performance PS5 companion helper daemon for PS5 Web File Manager",
   "main": "tests/protocol-test.js",
   "scripts": {
-    "test": "node tests/protocol-test.js && node tests/e2e-test.js && node tests/crypto-test.js"
+    "test": "node tests/protocol-test.js && node tests/e2e-test.js && node tests/crypto-test.js && node tests/rsa-test.js"
   },
   "keywords": [
     "ps5",

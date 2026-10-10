@@ -1,5 +1,5 @@
 /* Small self-contained crypto primitives (no OpenSSL, portable C99).
- * SHA-256, HMAC-SHA256, AES-128 block cipher, AES-128-XTS.
+ * SHA-1, SHA-256, HMAC-SHA256, AES-128 block cipher, AES-128-XTS, AES-128-CBC.
  * Not hardened against timing side channels (table-based AES); intended for
  * reading package files, not for protecting secrets from local attackers. */
 #ifndef WUP_CRYPTO_H
@@ -45,5 +45,25 @@ int aes_xts_decrypt(const uint8_t key1[16], const uint8_t key2[16], uint64_t sec
                     size_t sector_size, const uint8_t *in, uint8_t *out, size_t len);
 int aes_xts_encrypt(const uint8_t key1[16], const uint8_t key2[16], uint64_t sector,
                     size_t sector_size, const uint8_t *in, uint8_t *out, size_t len);
+
+/* AES-128-CBC without padding. len must be a multiple of 16. in and out may be
+ * the same buffer. Returns 0 on success, -1 on invalid arguments. */
+int aes128_cbc_decrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *in, uint8_t *out,
+                       size_t len);
+int aes128_cbc_encrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *in, uint8_t *out,
+                       size_t len);
+
+/* SHA-1 (needed for the RSA-OAEP / IMAGE_KEY chain; not for new designs). */
+typedef struct {
+    uint32_t h[5];
+    uint64_t total; /* bytes processed */
+    uint8_t buf[64];
+    size_t buflen;
+} sha1_ctx;
+
+void sha1_init(sha1_ctx *c);
+void sha1_update(sha1_ctx *c, const uint8_t *data, size_t len);
+void sha1_final(sha1_ctx *c, uint8_t out[20]);
+void sha1(const uint8_t *data, size_t len, uint8_t out[20]);
 
 #endif

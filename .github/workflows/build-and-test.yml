@@ -47,6 +47,10 @@ jobs:
         run: |
           node tests/crypto-test.js
 
+      - name: Run RSA Tests
+        run: |
+          node tests/rsa-test.js
+
   build-ps5:
     name: Build PS5 ELF
     runs-on: ubuntu-latest

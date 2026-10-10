@@ -265,3 +265,109 @@ int aes_xts_encrypt(const uint8_t key1[16], const uint8_t key2[16], uint64_t sec
                     size_t sector_size, const uint8_t *in, uint8_t *out, size_t len) {
     return xts_crypt(0, key1, key2, sector, sector_size, in, out, len);
 }
+
+/* ---------------- AES-128-CBC ---------------- */
+
+int aes128_cbc_decrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *in, uint8_t *out,
+                       size_t len) {
+    aes128_ctx cx;
+    uint8_t prev[16], cur[16], tmp[16];
+    size_t off;
+    int i;
+    if (len % 16) return -1;
+    aes128_set_key(&cx, key);
+    memcpy(prev, iv, 16);
+    for (off = 0; off < len; off += 16) {
+        memcpy(cur, in + off, 16); /* save ciphertext: in may alias out */
+        aes128_decrypt_block(&cx, cur, tmp);
+        for (i = 0; i < 16; i++) out[off + i] = (uint8_t)(tmp[i] ^ prev[i]);
+        memcpy(prev, cur, 16);
+    }
+    return 0;
+}
+
+int aes128_cbc_encrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t *in, uint8_t *out,
+                       size_t len) {
+    aes128_ctx cx;
+    uint8_t prev[16], tmp[16];
+    size_t off;
+    int i;
+    if (len % 16) return -1;
+    aes128_set_key(&cx, key);
+    memcpy(prev, iv, 16);
+    for (off = 0; off < len; off += 16) {
+        for (i = 0; i < 16; i++) tmp[i] = (uint8_t)(in[off + i] ^ prev[i]);
+        aes128_encrypt_block(&cx, tmp, prev);
+        memcpy(out + off, prev, 16);
+    }
+    return 0;
+}
+
+/* ---------------- SHA-1 ---------------- */
+
+#define ROL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+static void sha1_block(uint32_t h[5], const uint8_t *p) {
+    uint32_t w[80], a, b, c, d, e, f, k, t;
+    int i;
+    for (i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) |
+               ((uint32_t)p[4 * i + 2] << 8) | (uint32_t)p[4 * i + 3];
+    for (i = 16; i < 80; i++) w[i] = ROL32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4];
+    for (i = 0; i < 80; i++) {
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+        else { f = b ^ c ^ d; k = 0xca62c1d6; }
+        t = ROL32(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = ROL32(b, 30); b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+}
+
+void sha1_init(sha1_ctx *c) {
+    c->h[0] = 0x67452301; c->h[1] = 0xefcdab89; c->h[2] = 0x98badcfe;
+    c->h[3] = 0x10325476; c->h[4] = 0xc3d2e1f0;
+    c->total = 0;
+    c->buflen = 0;
+}
+
+void sha1_update(sha1_ctx *c, const uint8_t *data, size_t len) {
+    c->total += len;
+    if (c->buflen) {
+        size_t n = 64 - c->buflen;
+        if (n > len) n = len;
+        memcpy(c->buf + c->buflen, data, n);
+        c->buflen += n; data += n; len -= n;
+        if (c->buflen < 64) return;
+        sha1_block(c->h, c->buf);
+        c->buflen = 0;
+    }
+    while (len >= 64) { sha1_block(c->h, data); data += 64; len -= 64; }
+    if (len) { memcpy(c->buf, data, len); c->buflen = len; }
+}
+
+void sha1_final(sha1_ctx *c, uint8_t out[20]) {
+    uint64_t bits = c->total * 8;
+    uint8_t pad[72];
+    size_t padlen = (c->buflen < 56) ? 56 - c->buflen : 120 - c->buflen;
+    int i;
+    memset(pad, 0, sizeof pad);
+    pad[0] = 0x80;
+    for (i = 0; i < 8; i++) pad[padlen + i] = (uint8_t)(bits >> (56 - 8 * i));
+    sha1_update(c, pad, padlen + 8);
+    for (i = 0; i < 5; i++) {
+        out[4 * i] = (uint8_t)(c->h[i] >> 24);
+        out[4 * i + 1] = (uint8_t)(c->h[i] >> 16);
+        out[4 * i + 2] = (uint8_t)(c->h[i] >> 8);
+        out[4 * i + 3] = (uint8_t)c->h[i];
+    }
+}
+
+void sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
+    sha1_ctx c;
+    sha1_init(&c);
+    sha1_update(&c, data, len);
+    sha1_final(&c, out);
+}
