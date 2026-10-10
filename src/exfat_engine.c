@@ -51,10 +51,20 @@ static void put64_le(uint8_t *p, uint64_t v) {
   put32_le(p + 4, (uint32_t)(v >> 32));
 }
 
+/* OS-generated metadata never packed into an image; mirrors IGNORED_NAMES in
+ * ps5-ultrapack backend/mkpfs/utils.py (case-insensitive, "._*" by prefix). */
 static bool is_ignored(const char *name) {
-  if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".DS_Store") ||
-      !strcmp(name, "Thumbs.db") || !strncmp(name, "._", 2)) {
-    return true;
+  static const char *const ignored[] = {
+    ".", "..",
+    ".ds_store", ".spotlight-v100", ".trashes", ".fseventsd", ".temporaryitems",
+    ".documentrevisions-v100", ".apdisk", "__macosx", ".volumeicon.icns",
+    ".localized", ".appledouble", ".lsoverride", "icon\r",
+    "thumbs.db", "ehthumbs.db", "desktop.ini", "$recycle.bin",
+    "system volume information",
+  };
+  if (!strncmp(name, "._", 2)) return true;
+  for (size_t i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++) {
+    if (!strcasecmp(name, ignored[i])) return true;
   }
   return false;
 }

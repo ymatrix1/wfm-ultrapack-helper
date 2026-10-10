@@ -230,6 +230,18 @@ async function main() {
       const f = await convert(tree, path.join(work, 'no_such_dir'), 'exfat');
       assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /Failed to create output file/);
     });
+    await test('OS metadata is excluded from exfat images (matches ultrapack IGNORED_NAMES)', async () => {
+      const m = path.join(work, 'meta'); fs.mkdirSync(path.join(m, '$RECYCLE.BIN'), { recursive: true });
+      fs.writeFileSync(path.join(m, 'keep.txt'), 'k');
+      for (const n of ['Desktop.INI', 'Thumbs.db', '.DS_Store', '.Trashes', '._keep.txt', 'ehthumbs.db', '.localized']) fs.writeFileSync(path.join(m, n), 'x');
+      fs.writeFileSync(path.join(m, '$RECYCLE.BIN', 'junk'), 'x');
+      const f = await convert(m, out, 'exfat');
+      assert.strictEqual(f.type, T.DONE, f.payload);
+      const img = fs.readFileSync(path.join(out, 'meta.exfat'));
+      const has = n => img.includes(Buffer.from(n, 'utf16le'));
+      assert.ok(has('keep.txt'), 'control file must be present');
+      for (const n of ['Desktop.INI', 'Thumbs.db', '.DS_Store', '.Trashes', '._keep.txt', 'ehthumbs.db', '.localized', '$RECYCLE.BIN', 'junk']) assert.ok(!has(n), n + ' should be excluded');
+    });
     await test('case-insensitive duplicate names -> ERROR, no output left behind', async () => {
       const dup = path.join(work, 'dup'); fs.mkdirSync(dup);
       fs.writeFileSync(path.join(dup, 'Foo.txt'), 'a'); fs.writeFileSync(path.join(dup, 'foo.txt'), 'b');
