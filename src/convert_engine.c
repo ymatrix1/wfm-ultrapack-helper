@@ -141,15 +141,15 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   memset(hdr, 0, sizeof(hdr));
   hdr[0] = 'P'; hdr[1] = 'F'; hdr[2] = 'S'; hdr[3] = 'C'; /* 0x43534650 */
   hdr[8] = 6;
-  /* Logical block size */
-  hdr[16] = 0; hdr[17] = 0; hdr[18] = 1; hdr[19] = 0; /* 0x10000 = 64 KiB LE */
-  hdr[20] = 0; hdr[21] = 0; hdr[22] = 1; hdr[23] = 0;
-  /* Block count */
-  uint32_t boff_ptr = PFSC_BLOCK_OFFSETS_OFFSET;
-  uint32_t data_off_ptr = (uint32_t)initial_data_offset;
-  memcpy(hdr + 24, &boff_ptr, 4);
-  memcpy(hdr + 28, &data_off_ptr, 4);
-  memcpy(hdr + 32, &logical_size, 8);
+  uint32_t blk32 = PFSC_LOGICAL_BLOCK_SIZE;
+  uint64_t blk64 = PFSC_LOGICAL_BLOCK_SIZE;
+  uint64_t boff64 = PFSC_BLOCK_OFFSETS_OFFSET;
+  uint64_t data64 = initial_data_offset;
+  memcpy(hdr + 0x0C, &blk32, 4);
+  memcpy(hdr + 0x10, &blk64, 8);
+  memcpy(hdr + 0x18, &boff64, 8);
+  memcpy(hdr + 0x20, &data64, 8);
+  memcpy(hdr + 0x28, &logical_size, 8);
 
   if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
     snprintf(err_msg, err_len, "Failed writing PFSC header");
