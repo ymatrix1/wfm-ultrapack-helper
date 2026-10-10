@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   test:
-    name: Test & Build Linux
+    name: Test & Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,35 +31,54 @@ jobs:
         run: |
           node tests/protocol-test.js
 
-      - name: Upload Linux Binary
+  build-ps5:
+    name: Build PS5 ELF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools & LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config clang-15 lld-15 bash socat
+
+      - name: Build & Install PS5 Payload SDK
+        run: |
+          git clone --recurse-submodules https://github.com/ps5-payload-dev/sdk.git ps5-sdk
+          cd ps5-sdk
+          make
+          sudo make DESTDIR=/opt/ps5-payload-sdk install
+          echo "PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk" >> $GITHUB_ENV
+
+      - name: Build wfm-ultrapack-helper.elf
+        run: |
+          export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make ps5
+
+      - name: Upload ELF Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wfm-ultrapack-helper-linux
-          path: wfm-ultrapack-helper-linux
+          name: wfm-ultrapack-helper-elf
+          path: wfm-ultrapack-helper.elf
 
   release:
     name: Auto Release
-    needs: [ test ]
+    needs: [ test, build-ps5 ]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Linux Binary
+      - name: Download PS5 ELF
         uses: actions/download-artifact@v4
         with:
-          name: wfm-ultrapack-helper-linux
-
-      - name: Package Release Assets
-        run: |
-          chmod +x wfm-ultrapack-helper-linux
-          tar -czvf wfm-ultrapack-helper-linux.tar.gz wfm-ultrapack-helper-linux
+          name: wfm-ultrapack-helper-elf
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            wfm-ultrapack-helper-linux.tar.gz
+            wfm-ultrapack-helper.elf
           generate_release_notes: true
           draft: false
           prerelease: false
