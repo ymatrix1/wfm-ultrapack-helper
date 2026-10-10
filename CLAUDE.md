@@ -27,6 +27,10 @@ Guidelines and architecture instructions for `wfm-ultrapack-helper`.
   - State reuse via `deflateReset`.
   - Folder -> ffpfsc is zero-staging: exFAT stream feeds the PFSC encoder directly (no temp image), header/offset table backpatched at the end; single monotonic 0..100% progress.
   - Trailing slash sanitization.
+- `src/pkg_reader.c` & `src/pkg_reader.h`: random-access, no-extraction reader for PS4-family fake PKGs (CNT header, ENTRY_KEYS/EKPFS derivation, outer PFS XTS, PFSC, inner PFS, CNT-resident `sce_sys` files). Keys in the generated `src/pkg_keys.h` (public LibOrbisPkg keysets).
+- `src/crypto.c` & `src/rsa.c`: SHA-1/SHA-256, HMAC-SHA256, AES-128 (ECB/CBC/XTS), RSA-2048 CRT private op with PKCS#1 v1.5 / OAEP unpadding. No external crypto dependency.
+- The exFAT writer takes any source through a flat listing + read callback (`convert_listing_to_exfat` / `convert_listing_to_ffpfsc`); the folder and `.pkg` paths both use it.
+- Convert request payload: `source\ndest\nformat[\npasscode]`; the optional passcode is scrubbed after parsing and never logged or echoed.
 - `src/miniz.c` & `src/miniz.h`: Standalone amalgamated zlib library.
 - `src/protocol.h`: Wire protocol framing and constants.
 

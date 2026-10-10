@@ -122,6 +122,47 @@ async function test(name, fn) {
   catch (e) { results.push([name, false]); console.log('  FAIL ' + name + '\n       ' + (e.stack || e).toString().split('\n').slice(0, 4).join('\n       ')); }
 }
 
+
+// Minimal exFAT reader: walks the directory tree and returns {path -> Buffer-reader} so tests can
+// extract every file from a produced image and hash it independently of the writer.
+function exfatFiles(img) {
+  const bps = 1 << img[108], cs = bps << img[109];
+  const fatOff = img.readUInt32LE(80) * bps, heapOff = img.readUInt32LE(88) * bps;
+  const root = img.readUInt32LE(96), clusters = img.readUInt32LE(92);
+  const clOff = c => heapOff + (c - 2) * cs;
+  const chain = (first, len, noFat) => {
+    const parts = []; let c = first, left = len;
+    for (let n = 0; left > 0 && n <= clusters; n++) {
+      const take = Math.min(cs, left);
+      parts.push(img.subarray(clOff(c), clOff(c) + take)); left -= take;
+      if (noFat) c++; else { c = img.readUInt32LE(fatOff + c * 4); if (c === 0xffffffff) break; }
+    }
+    return Buffer.concat(parts);
+  };
+  const files = new Map();
+  const walk = (first, size, prefix, noFat) => {
+    const d = chain(first, size, noFat);
+    for (let o = 0; o + 32 <= d.length; o += 32) {
+      if (d[o] === 0) break;
+      if (d[o] !== 0x85) continue;
+      const sec = d[o + 1], attr = d.readUInt16LE(o + 4);
+      const st = d.subarray(o + 32, o + 64);
+      const nameLen = st[3], dataLen = Number(st.readBigUInt64LE(24)), fc = st.readUInt32LE(20), nofat = (st[1] & 2) !== 0;
+      let name = '';
+      for (let i = 2; i <= sec; i++) name += d.subarray(o + i * 32 + 2, o + i * 32 + 32).toString('utf16le');
+      name = name.slice(0, nameLen);
+      const full = prefix ? prefix + '/' + name : name;
+      if (attr & 0x10) walk(fc, dataLen, full, nofat);
+      else files.set(full, { size: dataLen, read: () => (dataLen ? chain(fc, dataLen, nofat) : Buffer.alloc(0)) });
+      o += sec * 32;
+    }
+  };
+  // root directory length: follow its FAT chain
+  let len = 0; for (let c = root, n = 0; n <= clusters; n++) { len += cs; c = img.readUInt32LE(fatOff + c * 4); if (c === 0xffffffff) break; }
+  walk(root, len, '', false);
+  return files;
+}
+
 async function main() {
   const work = fs.mkdtempSync(path.join('/tmp', 'wup-e2e-'));
   const out = path.join(work, 'out');
@@ -224,12 +265,13 @@ async function main() {
       const f = await convert(emptyFile, out, 'ffpfsc');
       assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /empty/);
     });
-    await test('PKG (\x7fCNT) source is rejected, not silently wrapped', async () => {
+    await test('corrupt/truncated PKG -> clean ERROR, no output left behind', async () => {
       const pkg = path.join(work, 'fake.pkg');
       fs.writeFileSync(pkg, Buffer.concat([Buffer.from([0x7f, 0x43, 0x4e, 0x54]), Buffer.alloc(4096)]));
       const f = await convert(pkg, out, 'ffpfsc');
-      assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /PKG packages are not supported/);
+      assert.strictEqual(f.type, T.ERROR);
       assert.ok(!fs.existsSync(path.join(out, 'fake.ffpfsc')));
+      assert.ok(!fs.existsSync(path.join(out, 'fake.exfat')));
     });
     await test('exfat from a regular file -> ERROR', async () => {
       const f = await convert(smallImg, out, 'exfat');
@@ -407,6 +449,79 @@ ffpfsc`)));
       assert.ok(inner.subarray(0, exfat.length).equals(exfat), 'inner image differs from exfat output');
       assert.ok(inner.subarray(exfat.length).every(x => x === 0), 'padding tail must be zero');
     });
+
+    // ---------- real PS5 packages (skipped when the fixtures are absent) ----------
+    const fixDir = process.env.PKG_FIXTURE_DIR || '/mnt/c/Users/yuri_/Downloads';
+    const bs = 65536;
+    const inflateFfpfsc = file => {
+      const d = fs.readFileSync(file);
+      const tbl = Number(d.readBigUInt64LE(0x18)), logical = Number(d.readBigUInt64LE(0x28));
+      const parts = [];
+      for (let i = 0; i < logical / bs; i++) {
+        const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
+        const c = d.subarray(a, e); parts.push(c.length === bs ? c : zlib.inflateSync(c));
+      }
+      return Buffer.concat(parts);
+    };
+    for (const name of ['PS5_LAPY20012_v1.00.pkg', 'PS5_ITEM00001_v1.14.pkg']) {
+      const pkgPath = path.join(fixDir, name);
+      if (!fs.existsSync(pkgPath)) { console.log('  skip ' + name + ' (fixture not present)'); continue; }
+      const base = name.replace(/\.pkg$/, '');
+      await test(`${name}: pkg -> exfat is fsck-clean and holds the package files`, async () => {
+        const f = await convert(pkgPath, out, 'exfat', 31);
+        assert.strictEqual(f.type, T.DONE, f.payload);
+        const img = path.join(out, base + '.exfat');
+        if (haveFsck) { const r = sh('fsck.exfat', [img]); assert.strictEqual(r.status, 0, r.stdout + r.stderr); }
+        const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests/fixtures', base + '.manifest.json'), 'utf8'));
+        const entries = (Array.isArray(manifest) ? manifest : (manifest.files || manifest.entries)).filter(x => x.sha256 !== undefined);
+        const files = exfatFiles(fs.readFileSync(img));
+        let checked = 0;
+        for (const e of entries) {
+          const f = files.get(e.path);
+          assert.ok(f, e.path + ' missing from the exFAT image');
+          assert.strictEqual(f.size, e.size, e.path + ' size');
+          assert.strictEqual(require('crypto').createHash('sha256').update(f.read()).digest('hex'), e.sha256, e.path + ' sha256');
+          checked++;
+        }
+        assert.ok(checked > 0);
+      });
+      await test(`${name}: pkg -> ffpfsc streams with no temp files and inflates to the exfat image`, async () => {
+        const f = await convert(pkgPath, out, 'ffpfsc', 32);
+        assert.strictEqual(f.type, T.DONE, f.payload);
+        assert.ok(!fs.readdirSync(out).some(n => /\.tmp/.test(n)), 'no temp files');
+        const inner = inflateFfpfsc(path.join(out, base + '.ffpfsc'));
+        const ex = fs.readFileSync(path.join(out, base + '.exfat'));
+        assert.ok(inner.subarray(0, ex.length).equals(ex), 'ffpfsc payload differs from the exfat image');
+        assert.ok(inner.subarray(ex.length).every(x => x === 0), 'padding must be zero');
+      });
+    }
+    {
+      const pkgPath = path.join(fixDir, 'PS5_LAPY20012_v1.00.pkg');
+      if (fs.existsSync(pkgPath)) {
+        await test('passcode field is accepted, never echoed (fake PKGs recover the key via the RSA chain)', async () => {
+          const c = new Client(); await c.ready();
+          const secret = 'WRONGPASSCODE0123456789abcdefghi';
+          c.send(frame(T.CONVERT, 33, Buffer.from(`${pkgPath}\n${out}\nexfat\n${secret}`)));
+          const f = await c.terminal();
+          assert.ok(!f.payload.includes(secret), 'passcode must not be echoed');
+          assert.strictEqual(f.type, T.DONE, f.payload);
+          c.close();
+        });
+        await test('PKG whose key digest does not match -> clear ERROR, no output left behind', async () => {
+          const bad = path.join(work, 'badkey.pkg');
+          const fd = fs.openSync(pkgPath, 'r'); const head = Buffer.alloc(0x3000); fs.readSync(fd, head, 0, head.length, 0); fs.closeSync(fd);
+          // ENTRY_KEYS (entry 0x10) data lives at 0x2000: flip the key digest[1] and every RSA key blob
+          for (let i = 0x2020; i < 0x2800; i++) head[i] ^= 0xff;
+          fs.copyFileSync(pkgPath, bad);
+          const w = fs.openSync(bad, 'r+'); fs.writeSync(w, head, 0, head.length, 0); fs.closeSync(w);
+          const f = await convert(bad, out, 'exfat', 34);
+          fs.unlinkSync(bad);
+          assert.strictEqual(f.type, T.ERROR);
+          assert.match(f.payload, /EKPFS|passcode|key/i);
+          assert.ok(!fs.existsSync(path.join(out, 'badkey.exfat')));
+        });
+      }
+    }
   } finally {
     daemon.kill('SIGKILL');
     try { fs.unlinkSync(SOCK); } catch (_) {}

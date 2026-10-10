@@ -141,6 +141,7 @@ typedef struct worker_job {
   char source[4096];
   char destination[4096];
   char format[64];
+  char passcode[64];   /* optional PKG passcode; never logged or echoed */
   uint64_t request_id;
 } worker_job_t;
 
@@ -184,7 +185,8 @@ static void *conversion_worker_thread(void *arg) {
   worker_job_t *job = (worker_job_t *)arg;
   char err_msg[1024] = {0};
 
-  int ret = run_conversion(job->source, job->destination, job->format,
+  int ret = run_conversion_ex(job->source, job->destination, job->format,
+                           job->passcode[0] ? job->passcode : NULL,
                            on_convert_progress, check_cancel,
                            job, err_msg, sizeof(err_msg));
 
@@ -256,9 +258,15 @@ handle_client(void *arg) {
       char *second_nl = strchr(rem, '\n');
       char *dst_path = rem;
       char *fmt_str = "ffpfsc";
+      char *passcode = "";
       if (second_nl) {
         *second_nl = '\0';
         fmt_str = second_nl + 1;
+        char *third_nl = strchr(fmt_str, '\n');
+        if (third_nl) {
+          *third_nl = '\0';
+          passcode = third_nl + 1;
+        }
       }
 
       if (!is_safe_path(src_path) || !is_safe_path(dst_path)) {
@@ -279,6 +287,9 @@ handle_client(void *arg) {
       strncpy(job->source, src_path, sizeof(job->source) - 1);
       strncpy(job->destination, dst_path, sizeof(job->destination) - 1);
       strncpy(job->format, fmt_str, sizeof(job->format) - 1);
+      strncpy(job->passcode, passcode, sizeof(job->passcode) - 1);
+      /* scrub the passcode from the receive buffer */
+      memset(passcode, 0, strlen(passcode));
 
       ctx->cancel_requested = false;
       ctx->is_busy = true;

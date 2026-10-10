@@ -31,6 +31,12 @@ int convert_listing_to_ffpfsc(const exfat_listing_entry_t *entries, size_t count
                               void *user_data, char *err_msg, size_t err_len);
 
 /* High-level conversion dispatcher from source -> target format */
+/* Same as run_conversion, with an optional PKG passcode (NULL = default 32 x '0'). */
+int run_conversion_ex(const char *source_path, const char *dest_path, const char *format_str,
+                      const char *passcode,
+                      convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                      void *user_data, char *err_msg, size_t err_len);
+
 int run_conversion(const char *source_path, const char *dest_path, const char *format_str,
                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                    void *user_data, char *err_msg, size_t err_len);

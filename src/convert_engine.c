@@ -1,4 +1,5 @@
 #include "convert_engine.h"
+#include "pkg_reader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -413,9 +414,58 @@ int convert_listing_to_ffpfsc(const exfat_listing_entry_t *entries, size_t count
                           user_data, err_msg, err_len);
 }
 
+/* ---- PKG source: package -> pkg_reader -> listing -> exFAT [-> PFSC], zero staging ---- */
+
+static int pkg_read_cb(void *ctx, uint64_t file_id, uint64_t offset, void *buf, size_t len) {
+  int64_t n = pkgr_read((pkgr_t *)ctx, (size_t)file_id, offset, buf, len);
+  return n < 0 ? -1 : (int)n;
+}
+
+static int convert_pkg(const char *pkg_path, const char *target_file, bool is_exfat,
+                       const char *passcode,
+                       convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                       void *user_data, char *err_msg, size_t err_len) {
+  pkgr_t *pkg = NULL;
+  if (pkgr_open(pkg_path, passcode, &pkg, err_msg, err_len) != 0) {
+    if (!err_msg[0]) snprintf(err_msg, err_len, "Cannot open package");
+    return -1;
+  }
+  size_t n = pkgr_entry_count(pkg);
+  exfat_listing_entry_t *list = (exfat_listing_entry_t *)calloc(n ? n : 1, sizeof(*list));
+  if (!list) {
+    pkgr_close(pkg);
+    snprintf(err_msg, err_len, "Out of memory for package listing");
+    return -1;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const pkgr_entry_t *e = pkgr_entry(pkg, i);
+    list[i].path = e->path;
+    list[i].size = e->size;
+    list[i].is_dir = e->is_dir;
+    list[i].file_id = i;
+  }
+  exfat_src_ops_t ops = { pkg_read_cb };
+  int ret = is_exfat
+    ? convert_listing_to_exfat(list, n, &ops, pkg, target_file, progress_cb, cancel_cb,
+                               user_data, err_msg, err_len)
+    : convert_listing_to_ffpfsc(list, n, &ops, pkg, target_file, progress_cb, cancel_cb,
+                                user_data, err_msg, err_len);
+  free(list);
+  pkgr_close(pkg);
+  return ret;
+}
+
 int run_conversion(const char *source_path, const char *dest_path, const char *format_str,
                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                    void *user_data, char *err_msg, size_t err_len) {
+  return run_conversion_ex(source_path, dest_path, format_str, NULL, progress_cb, cancel_cb,
+                           user_data, err_msg, err_len);
+}
+
+int run_conversion_ex(const char *source_path, const char *dest_path, const char *format_str,
+                      const char *passcode,
+                      convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                      void *user_data, char *err_msg, size_t err_len) {
   struct stat st;
   if (stat(source_path, &st) != 0) {
     snprintf(err_msg, err_len, "Source path does not exist: %s", strerror(errno));
@@ -473,21 +523,21 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
                                       user_data, err_msg, err_len);
     }
   } else {
-    /* If source is an exfat/raw image file and target is ffpfsc */
-    if (!is_exfat_target) {
-      /* A .pkg is not a filesystem image: compressing it would silently produce
-       * a container that cannot be mounted. Reject until PKG extraction exists. */
+    /* A .pkg (CNT magic) is read in place and streamed: no extraction, no temp image */
+    {
       FILE *probe = fopen(sanitized_source, "rb");
       if (probe) {
         unsigned char magic[4] = {0};
         size_t got = fread(magic, 1, sizeof(magic), probe);
         fclose(probe);
-        if (got == 4 && !memcmp(magic, "" "CNT", 4)) {
-          snprintf(err_msg, err_len,
-                   "PKG packages are not supported yet; extract to a folder, then convert the folder");
-          return -1;
+        if (got == 4 && magic[0] == 0x7f && !memcmp(magic + 1, "CNT", 3)) {
+          return convert_pkg(sanitized_source, target_file, is_exfat_target, passcode,
+                             progress_cb, cancel_cb, user_data, err_msg, err_len);
         }
       }
+    }
+    /* If source is an exfat/raw image file and target is ffpfsc */
+    if (!is_exfat_target) {
       return convert_image_to_ffpfsc(sanitized_source, target_file, progress_cb, cancel_cb,
                                      user_data, err_msg, err_len);
     } else {
