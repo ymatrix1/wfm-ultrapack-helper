@@ -14,6 +14,7 @@ See [CLAUDE.md](CLAUDE.md) for build, testing commands, architecture, and code c
    - Use `lstat` to reject symlinks and detect case-insensitive collisions.
    - Allocate transfer buffers on the heap; do not blow worker thread stacks.
 3. **PFSC Compression Engine:**
+   - `.ffpfsc` must be a PFS image (header, inodes, flat path table) holding ONE inner file whose data is the PFSC container (PFSC is NOT at file offset 0); keep byte parity of the metadata with ultrapack (`tests/pfs_parity.py`).
    - Maintain 64 KiB block alignment with zero padding for uncompressed tail blocks.
    - Reuse `z_stream` state across chunks with `deflateReset`.
    - Map multi-stage progress (e.g. folder -> exfat -> ffpfsc) to a monotonic 0..100% envelope.
