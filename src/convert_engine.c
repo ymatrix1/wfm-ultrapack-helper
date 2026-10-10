@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 static double mono_s(void) {
   struct timespec ts;
@@ -43,8 +44,138 @@ static uint64_t pfsc_data_offset(uint32_t block_count) {
   return off;
 }
 
-/* Backpatch PFSC header and block offset table. Returns 0 or -1 (err_msg set). */
-static int pfsc_write_header(FILE *fout, const uint64_t *offsets, uint32_t block_count,
+/* ---- PFS wrapper: the .ffpfsc is a PFS image (unsigned, unencrypted, 64 KiB blocks, 32-bit inodes)
+ * holding ONE inner file whose data is a PFSC container. Layout mirrors ultrapack's
+ * build_pfs_stream_from_exfat; the front metadata is fixed-size so the payload base is a constant:
+ *   block 0 header | 1 inode table | 2 super_root dirents | 3 flat_path_table | 4 reserved empty |
+ *   5 uroot dirents | 6.. PFSC container (header 0x30, offset table at +0x400, zlib blocks).
+ * All PFSC offsets are relative to the start of the PFSC container (block 6). */
+#define PFS_BLOCK_SIZE 0x10000U
+#define PFS_MAGIC_VALUE 20130315
+#define PFS_VERSION_PS5 2
+#define PFS_MODE_CASE_INSENSITIVE 0x8U
+#define PFS_INODE_COUNT 4
+#define PFS_INODE_SIZE 0xA8U
+#define PFS_PAYLOAD_BLOCK 6U
+#define PFS_PAYLOAD_BASE ((uint64_t)PFS_PAYLOAD_BLOCK * PFS_BLOCK_SIZE)
+#define PFS_FRONT_BYTES ((size_t)PFS_PAYLOAD_BLOCK * PFS_BLOCK_SIZE)
+#define INODE_RX_ONLY 0x16DU /* o+r o+x g+r g+x u+r u+x */
+#define INODE_MODE_DIR 0x4000U
+#define INODE_MODE_FILE 0x8000U
+#define INODE_FLAG_COMPRESSED 0x1U
+#define INODE_FLAG_READONLY 0x10U
+#define INODE_FLAG_INTERNAL 0x20000U
+#define DIRENT_TYPE_FILE 2
+#define DIRENT_TYPE_DIRECTORY 3
+#define DIRENT_TYPE_DOT 4
+#define DIRENT_TYPE_DOTDOT 5
+#define PFS_INNER_NAME_MAX 200
+
+static void put16_le(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xFF);
+  p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+/* One directory entry; returns its aligned size. */
+static size_t pfs_put_dirent(uint8_t *p, uint32_t ino, int32_t type, const char *name) {
+  size_t nl = strlen(name);
+  size_t ent = nl + 17;
+  if (ent % 8) ent += 8 - ent % 8;
+  put32_le(p, ino);
+  put32_le(p + 4, (uint32_t)type);
+  put32_le(p + 8, (uint32_t)nl);
+  put32_le(p + 12, (uint32_t)ent);
+  memcpy(p + 16, name, nl);
+  return ent;
+}
+
+/* Unsigned D32 inode (0xA8 bytes): db[0]=db0, db[1..11]=dbrest, ib[] zero. */
+static void pfs_put_inode(uint8_t *p, uint32_t mode, uint32_t nlink, uint32_t flags, uint64_t size,
+                          uint64_t size_c, uint64_t now, uint32_t blocks, int32_t db0, int32_t dbrest) {
+  put16_le(p, mode);
+  put16_le(p + 2, nlink);
+  put32_le(p + 4, flags);
+  put64_le(p + 8, size);
+  put64_le(p + 0x10, size_c);
+  for (int i = 0; i < 4; i++) put64_le(p + 0x18 + 8 * i, now);
+  /* nsec x4, uid, gid, unk1, unk2 = 0 (0x38..0x5F) */
+  put32_le(p + 0x60, blocks);
+  put32_le(p + 0x64, (uint32_t)db0);
+  for (int i = 1; i < 12; i++) put32_le(p + 0x64 + 4 * i, (uint32_t)dbrest);
+}
+
+/* ultrapack fpt_hash over "/<name>", upper-cased (case-insensitive image). */
+static uint32_t pfs_fpt_hash(const char *name) {
+  uint32_t h = (uint32_t)'/';
+  for (const char *c = name; *c; c++) h = (uint32_t)toupper((unsigned char)*c) + 31U * h;
+  return h;
+}
+
+/* Build the PFS_PAYLOAD_BLOCK front blocks. stored_size == 0 means the file inode is provisional. */
+static void pfs_build_front(uint8_t *buf, const char *inner, uint64_t now, uint64_t raw_size,
+                            uint64_t stored_size, uint64_t final_ndblock) {
+  const uint32_t bs = PFS_BLOCK_SIZE;
+  memset(buf, 0, PFS_FRONT_BYTES);
+
+  /* block 0: header */
+  put64_le(buf + 0x00, PFS_VERSION_PS5);
+  put64_le(buf + 0x08, PFS_MAGIC_VALUE);
+  buf[0x1A] = 1; /* readonly */
+  put16_le(buf + 0x1C, PFS_MODE_CASE_INSENSITIVE);
+  put32_le(buf + 0x20, bs);
+  put64_le(buf + 0x28, 1); /* nblock */
+  put64_le(buf + 0x30, PFS_INODE_COUNT);
+  put64_le(buf + 0x38, final_ndblock);
+  put64_le(buf + 0x40, 1); /* inode block count */
+  {
+    uint8_t *sig = buf + 0x50; /* InodeBlockSig (0x310 bytes) */
+    put16_le(sig + 0x02, 1);
+    put32_le(sig + 0x04, INODE_FLAG_READONLY);
+    put64_le(sig + 0x08, bs);
+    put64_le(sig + 0x10, bs);
+    for (int i = 0; i < 4; i++) put64_le(sig + 0x18 + 8 * i, now);
+    put32_le(sig + 0x60, 1);
+    put64_le(sig + 0x68 + 32, 1); /* db[0] = block 1 */
+  }
+  put32_le(buf + 0x368, 1);
+
+  /* block 3: flat path table (one entry for the inner file -> inode 3) */
+  uint8_t *fpt = buf + (size_t)3 * bs;
+  put32_le(fpt, pfs_fpt_hash(inner));
+  put32_le(fpt + 4, 3);
+
+  /* block 1: inode table */
+  uint8_t *ino = buf + bs;
+  pfs_put_inode(ino + 0 * PFS_INODE_SIZE, INODE_MODE_DIR | INODE_RX_ONLY, 1,
+                INODE_FLAG_INTERNAL | INODE_FLAG_READONLY, bs, bs, now, 1, 2, 0);
+  pfs_put_inode(ino + 1 * PFS_INODE_SIZE, INODE_MODE_FILE | INODE_RX_ONLY, 1,
+                INODE_FLAG_INTERNAL | INODE_FLAG_READONLY, 8, 8, now, 1, 3, -1);
+  pfs_put_inode(ino + 2 * PFS_INODE_SIZE, INODE_MODE_DIR | INODE_RX_ONLY, 3,
+                INODE_FLAG_READONLY, bs, bs, now, 1, 5, -1);
+  if (stored_size) {
+    uint32_t fblocks = (uint32_t)((stored_size + bs - 1) / bs);
+    pfs_put_inode(ino + 3 * PFS_INODE_SIZE, INODE_MODE_FILE | INODE_RX_ONLY, 1,
+                  INODE_FLAG_READONLY | INODE_FLAG_COMPRESSED, stored_size, raw_size, now, fblocks,
+                  (int32_t)PFS_PAYLOAD_BLOCK, -1);
+  } else {
+    pfs_put_inode(ino + 3 * PFS_INODE_SIZE, INODE_MODE_FILE | INODE_RX_ONLY, 1,
+                  INODE_FLAG_READONLY, 0, 0, now, 1, (int32_t)PFS_PAYLOAD_BLOCK, -1);
+  }
+
+  /* block 2: super_root dirents */
+  uint8_t *sr = buf + (size_t)2 * bs;
+  sr += pfs_put_dirent(sr, 1, DIRENT_TYPE_FILE, "flat_path_table");
+  pfs_put_dirent(sr, 2, DIRENT_TYPE_DIRECTORY, "uroot");
+
+  /* block 5: uroot dirents */
+  uint8_t *ur = buf + (size_t)5 * bs;
+  ur += pfs_put_dirent(ur, 2, DIRENT_TYPE_DOT, ".");
+  ur += pfs_put_dirent(ur, 2, DIRENT_TYPE_DOTDOT, "..");
+  pfs_put_dirent(ur, 3, DIRENT_TYPE_FILE, inner);
+}
+
+/* Backpatch PFSC header and block offset table at the PFSC container start (base). */
+static int pfsc_write_header(FILE *fout, uint64_t base, const uint64_t *offsets, uint32_t block_count,
                              uint64_t initial_data_offset, uint64_t logical_size,
                              char *err_msg, size_t err_len) {
   uint8_t hdr[PFSC_HEADER_SIZE];
@@ -57,11 +188,11 @@ static int pfsc_write_header(FILE *fout, const uint64_t *offsets, uint32_t block
   put64_le(hdr + 0x20, initial_data_offset);
   put64_le(hdr + 0x28, logical_size);
 
-  if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
+  if (fseeko(fout, (off_t)base, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
     snprintf(err_msg, err_len, "Failed writing PFSC header: %s", strerror(errno));
     return -1;
   }
-  if (fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET) != 0) {
+  if (fseeko(fout, (off_t)(base + PFSC_BLOCK_OFFSETS_OFFSET), SEEK_SET) != 0) {
     snprintf(err_msg, err_len, "Failed seeking to block offset table: %s", strerror(errno));
     return -1;
   }
@@ -151,6 +282,8 @@ typedef struct pfsc_sink {
   uint64_t initial_data_offset;
   uint64_t cur_off;
   uint64_t logical_size;
+  uint64_t now;                            /* PFS timestamps (time(NULL) or WUP_FIXED_TIME) */
+  char inner_name[PFS_INNER_NAME_MAX + 1]; /* name of the single inner file */
   z_stream strm;
   bool zinit;
   char err[256];
@@ -373,6 +506,24 @@ static int pfsc_sink_begin(uint64_t total_bytes, void *ctx) {
     s->zinit = true;
   }
 
+  if (!s->inner_name[0]) {
+    snprintf(s->err, sizeof(s->err), "Inner file name not set");
+    return -1;
+  }
+  uint8_t *front = (uint8_t *)malloc(PFS_FRONT_BYTES);
+  if (!front) {
+    snprintf(s->err, sizeof(s->err), "Out of memory for PFS metadata");
+    return -1;
+  }
+  pfs_build_front(front, s->inner_name, s->now, total_bytes, 0, 0);
+  size_t fw = fwrite(front, 1, PFS_FRONT_BYTES, s->f);
+  free(front);
+  if (fw != PFS_FRONT_BYTES) {
+    snprintf(s->err, sizeof(s->err), "Failed writing PFS metadata: %s", strerror(errno));
+    return -1;
+  }
+
+  /* Reserve the PFSC header + offset table area (backpatched at the end). */
   uint8_t zero_buf[4096] = {0};
   uint64_t pad = s->initial_data_offset;
   while (pad > 0) {
@@ -499,8 +650,166 @@ static int pfsc_sink_finish(pfsc_sink_t *s) {
     return -1;
   }
   s->offsets[s->block_count] = s->cur_off;
-  return pfsc_write_header(s->f, s->offsets, s->block_count, s->initial_data_offset,
-                           s->logical_size, s->err, sizeof(s->err));
+  if (pfsc_write_header(s->f, PFS_PAYLOAD_BASE, s->offsets, s->block_count, s->initial_data_offset,
+                        s->logical_size, s->err, sizeof(s->err)) != 0) return -1;
+
+  /* Final PFS metadata: stored size, file inode and header block total are only known now. */
+  uint64_t stored = s->cur_off;
+  uint64_t final_ndblock = PFS_PAYLOAD_BLOCK + (stored + PFS_BLOCK_SIZE - 1) / PFS_BLOCK_SIZE;
+  uint8_t *front = (uint8_t *)malloc(PFS_FRONT_BYTES);
+  if (!front) {
+    snprintf(s->err, sizeof(s->err), "Out of memory for PFS metadata");
+    return -1;
+  }
+  pfs_build_front(front, s->inner_name, s->now, s->total_bytes, stored, final_ndblock);
+  int rc = (fseeko(s->f, 0, SEEK_SET) == 0 && fwrite(front, 1, PFS_FRONT_BYTES, s->f) == PFS_FRONT_BYTES) ? 0 : -1;
+  free(front);
+  if (rc != 0) {
+    snprintf(s->err, sizeof(s->err), "Failed backpatching PFS metadata: %s", strerror(errno));
+    return -1;
+  }
+  if (fflush(s->f) != 0 || ftruncate(fileno(s->f), (off_t)(final_ndblock * PFS_BLOCK_SIZE)) != 0) {
+    snprintf(s->err, sizeof(s->err), "Failed finalizing image size: %s", strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+/* ---- inner file naming (ultrapack: default_image_basename / resolve_single_file_inner_name) ---- */
+
+/* ASCII [A-Za-z0-9._-] only, one '_' per other code point (like _sanitize_name_component). */
+static void pfs_sanitize_component(const char *in, char *out, size_t cap) {
+  size_t o = 0;
+  for (const unsigned char *c = (const unsigned char *)in; *c && o + 1 < cap; c++) {
+    if ((*c & 0xC0) == 0x80) continue; /* UTF-8 continuation byte */
+    out[o++] = ((*c < 0x80 && isalnum(*c)) || *c == '.' || *c == '_' || *c == '-') ? (char)*c : '_';
+  }
+  out[o] = '\0';
+}
+
+/* Value of "titleId" (or "title_id") in param.json text; returns 1 when found. */
+static int pfs_param_title_id(const char *json, size_t len, char *out, size_t cap) {
+  static const char *const keys[] = { "\"titleId\"", "\"title_id\"" };
+  for (int k = 0; k < 2; k++) {
+    size_t kl = strlen(keys[k]);
+    for (size_t i = 0; i + kl <= len; i++) {
+      if (memcmp(json + i, keys[k], kl) != 0) continue;
+      size_t j = i + kl;
+      while (j < len && isspace((unsigned char)json[j])) j++;
+      if (j >= len || json[j] != ':') continue;
+      j++;
+      while (j < len && isspace((unsigned char)json[j])) j++;
+      if (j >= len || json[j] != '"') continue;
+      j++;
+      size_t o = 0;
+      while (j < len && json[j] != '"' && json[j] != '\\' && o + 1 < cap) out[o++] = json[j++];
+      if (j >= len || json[j] != '"') continue;
+      while (o > 0 && isspace((unsigned char)out[o - 1])) o--;
+      size_t st = 0;
+      while (st < o && isspace((unsigned char)out[st])) st++;
+      memmove(out, out + st, o - st);
+      o -= st;
+      out[o] = '\0';
+      if (o > 0) return 1;
+    }
+  }
+  return 0;
+}
+
+/* "<titleId or fallback>.exfat" for exFAT-stream sources (folder / listing / pkg). */
+static void pfs_stream_inner_name(const char *title_id, const char *fallback, char *out, size_t cap) {
+  char base[PFS_INNER_NAME_MAX - 8];
+  pfs_sanitize_component(title_id && title_id[0] ? title_id : (fallback && fallback[0] ? fallback : "image"),
+                         base, sizeof(base));
+  if (!base[0]) snprintf(base, sizeof(base), "image");
+  snprintf(out, cap, "%s.exfat", base);
+}
+
+static int pfs_is_upper(int c) { return c >= 'A' && c <= 'Z'; }
+static int pfs_is_digit(int c) { return c >= '0' && c <= '9'; }
+static int pfs_is_alnum_up(int c) { return pfs_is_upper(c) || pfs_is_digit(c); }
+
+/* Preferred title ID inside a file stem (ABCD12345, ABCD12345_NN, legacy ABCD-12345). */
+static int pfs_stem_title_id(const char *st, char *out) {
+  size_t n = strlen(st);
+  for (size_t i = 0; i + 9 <= n; i++) { /* modern */
+    int ok = 1;
+    for (int k = 0; k < 4 && ok; k++) ok = pfs_is_upper((unsigned char)st[i + k]);
+    for (int k = 4; k < 9 && ok; k++) ok = pfs_is_digit((unsigned char)st[i + k]);
+    if (!ok) continue;
+    if (i > 0 && pfs_is_alnum_up((unsigned char)st[i - 1])) continue;
+    if (i + 9 < n && pfs_is_alnum_up((unsigned char)st[i + 9])) continue;
+    memcpy(out, st + i, 9); out[9] = '\0';
+    return 1;
+  }
+  for (size_t i = 0; i + 12 <= n; i++) { /* long form ABCD12345_NN */
+    int ok = 1;
+    for (int k = 0; k < 4 && ok; k++) ok = pfs_is_upper((unsigned char)st[i + k]);
+    for (int k = 4; k < 9 && ok; k++) ok = pfs_is_digit((unsigned char)st[i + k]);
+    ok = ok && st[i + 9] == '_' && pfs_is_digit((unsigned char)st[i + 10]) && pfs_is_digit((unsigned char)st[i + 11]);
+    if (!ok) continue;
+    memcpy(out, st + i, 9); out[9] = '\0';
+    return 1;
+  }
+  for (size_t i = 0; i + 10 <= n; i++) { /* legacy ABCD-12345 */
+    int ok = 1;
+    for (int k = 0; k < 4 && ok; k++) ok = pfs_is_upper((unsigned char)st[i + k]);
+    ok = ok && st[i + 4] == '-';
+    for (int k = 5; k < 10 && ok; k++) ok = pfs_is_digit((unsigned char)st[i + k]);
+    if (!ok) continue;
+    if (i > 0 && (pfs_is_alnum_up((unsigned char)st[i - 1]) || st[i - 1] == '-')) continue;
+    if (i + 10 < n && (pfs_is_alnum_up((unsigned char)st[i + 10]) || st[i + 10] == '-')) continue;
+    memcpy(out, st + i, 10); out[10] = '\0';
+    return 1;
+  }
+  return 0;
+}
+
+/* Inner name for a raw image source: ultrapack's resolve_single_file_inner_name (rename on):
+ * a title ID found in the stem, else the stem collapsed to <=15 ASCII chars, plus the lower-cased
+ * extension(s). */
+static void pfs_image_inner_name(const char *path, char *out, size_t cap) {
+  const char *b = strrchr(path, '/');
+  b = b ? b + 1 : path;
+  size_t bl = strlen(b), stem_len = bl;
+  for (size_t i = 1; i < bl; i++) {
+    if (b[i] == '.') { stem_len = i; break; }
+  }
+  char stem[256], ext[64];
+  snprintf(stem, sizeof(stem), "%.*s", (int)(stem_len < sizeof(stem) ? stem_len : sizeof(stem) - 1), b);
+  snprintf(ext, sizeof(ext), "%s", b + stem_len);
+  for (char *e = ext; *e; e++) *e = (char)tolower((unsigned char)*e);
+  for (char *e = ext; *e; e++) if (!((*e >= 'a' && *e <= 'z') || (*e >= '0' && *e <= '9') || *e == '.' || *e == '_' || *e == '-')) *e = '_';
+  char safe[32], tid[16];
+  if (pfs_stem_title_id(stem, tid)) {
+    snprintf(safe, sizeof(safe), "%s", tid);
+  } else {
+    size_t o = 0;
+    char pending = 0;
+    for (const unsigned char *c = (const unsigned char *)stem; *c && o < 15; c++) {
+      if (*c < 0x80 && isalnum(*c)) {
+        if (pending && o > 0) { safe[o++] = pending; if (o >= 15) break; }
+        safe[o++] = (char)*c;
+        pending = 0;
+      } else if (*c == ' ') {
+        pending = '_';
+      } else if (*c == '_' || *c == '-') {
+        pending = (char)*c;
+      }
+    }
+    safe[o] = '\0';
+    if (!safe[0]) snprintf(safe, sizeof(safe), "image");
+  }
+  snprintf(out, cap, "%s%s", safe, ext);
+}
+
+/* Set the inner name and timestamp; must precede pfsc_sink_begin. */
+static void pfsc_sink_setup(pfsc_sink_t *s, const char *inner_name) {
+  snprintf(s->inner_name, sizeof(s->inner_name), "%s", inner_name);
+  const char *fx = getenv("WUP_FIXED_TIME");
+  char *endp = NULL;
+  unsigned long long v = (fx && *fx) ? strtoull(fx, &endp, 10) : 0;
+  s->now = (fx && *fx && endp && *endp == '\0') ? (uint64_t)v : (uint64_t)time(NULL);
 }
 
 /* Raw image file -> .ffpfsc through the same (optionally multithreaded) sink as the exFAT streams. */
@@ -544,6 +853,9 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     return -1;
   }
 
+  char inner[PFS_INNER_NAME_MAX + 1];
+  pfs_image_inner_name(in_image_path, inner, sizeof(inner));
+  pfsc_sink_setup(s, inner);
   int ret = pfsc_sink_begin(total_input_size, s);
   uint64_t done = 0;
   double t_start = mono_s(), t_read = 0, t_sink = 0, t_mark = t_start;
@@ -601,7 +913,7 @@ typedef int (*ffpfsc_stream_fn)(void *run_ctx, exfat_begin_fn begin_fn, exfat_si
                                 convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                                 void *user_data, char *err_msg, size_t err_len);
 
-static int stream_to_ffpfsc(const char *out_ffpfsc_path, ffpfsc_stream_fn run, void *run_ctx,
+static int stream_to_ffpfsc(const char *out_ffpfsc_path, const char *title_id, ffpfsc_stream_fn run, void *run_ctx,
                             convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                             void *user_data, char *err_msg, size_t err_len) {
   pfsc_sink_t *s = (pfsc_sink_t *)calloc(1, sizeof(*s));
@@ -616,6 +928,17 @@ static int stream_to_ffpfsc(const char *out_ffpfsc_path, ffpfsc_stream_fn run, v
     free(s);
     return -1;
   }
+
+  /* Inner file: <titleId>.exfat (param.json), else the output name. */
+  char fallback[256], inner[PFS_INNER_NAME_MAX + 1];
+  {
+    const char *b = strrchr(out_ffpfsc_path, '/');
+    snprintf(fallback, sizeof(fallback), "%s", b ? b + 1 : out_ffpfsc_path);
+    char *dot = strrchr(fallback, '.');
+    if (dot) *dot = '\0';
+  }
+  pfs_stream_inner_name(title_id, fallback, inner, sizeof(inner));
+  pfsc_sink_setup(s, inner);
 
   int ret = run(run_ctx, pfsc_sink_begin, pfsc_sink_write, s, progress_cb, cancel_cb, user_data, err_msg, err_len);
   if (ret == 0 && pfsc_sink_finish(s) != 0) ret = -1;
@@ -645,7 +968,20 @@ static int run_folder_stream(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, v
 static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpfsc_path,
                                     convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                                     void *user_data, char *err_msg, size_t err_len) {
-  return stream_to_ffpfsc(out_ffpfsc_path, run_folder_stream, (void *)source_dir, progress_cb, cancel_cb,
+  char tid[128] = "";
+  char pj[4096 + 32];
+  snprintf(pj, sizeof(pj), "%s/sce_sys/param.json", source_dir);
+  FILE *pf = fopen(pj, "rb");
+  if (pf) {
+    char *js = (char *)malloc(65536);
+    if (js) {
+      size_t n = fread(js, 1, 65536, pf);
+      if (!pfs_param_title_id(js, n, tid, sizeof(tid))) tid[0] = 0;
+      free(js);
+    }
+    fclose(pf);
+  }
+  return stream_to_ffpfsc(out_ffpfsc_path, tid, run_folder_stream, (void *)source_dir, progress_cb, cancel_cb,
                           user_data, err_msg, err_len);
 }
 
@@ -662,13 +998,22 @@ static int run_listing_stream(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, 
   return convert_listing_to_exfat_stream(ls->entries, ls->count, ls->ops, ls->ops_ctx, b, s, sc, p, c, u, e, el);
 }
 
+int convert_listing_to_ffpfsc_ex(const exfat_listing_entry_t *entries, size_t count,
+                                 const exfat_src_ops_t *ops, void *ops_ctx, const char *out_ffpfsc_path,
+                                 const char *title_id,
+                                 convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                 void *user_data, char *err_msg, size_t err_len) {
+  listing_stream_t ls = { entries, count, ops, ops_ctx };
+  return stream_to_ffpfsc(out_ffpfsc_path, title_id, run_listing_stream, &ls, progress_cb, cancel_cb,
+                          user_data, err_msg, err_len);
+}
+
 int convert_listing_to_ffpfsc(const exfat_listing_entry_t *entries, size_t count,
                               const exfat_src_ops_t *ops, void *ops_ctx, const char *out_ffpfsc_path,
                               convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                               void *user_data, char *err_msg, size_t err_len) {
-  listing_stream_t ls = { entries, count, ops, ops_ctx };
-  return stream_to_ffpfsc(out_ffpfsc_path, run_listing_stream, &ls, progress_cb, cancel_cb,
-                          user_data, err_msg, err_len);
+  return convert_listing_to_ffpfsc_ex(entries, count, ops, ops_ctx, out_ffpfsc_path, NULL, progress_cb,
+                                      cancel_cb, user_data, err_msg, err_len);
 }
 
 /* ---- PKG source: package -> pkg_reader -> listing -> exFAT [-> PFSC], zero staging ---- */
@@ -702,11 +1047,29 @@ static int convert_pkg(const char *pkg_path, const char *target_file, bool is_ex
     list[i].file_id = i;
   }
   exfat_src_ops_t ops = { pkg_read_cb };
+  char tid[128] = "";
+  if (!is_exfat) {
+    for (size_t i = 0; i < n; i++) {
+      if (list[i].is_dir || list[i].size == 0 || strcmp(list[i].path, "sce_sys/param.json") != 0) continue;
+      size_t want = list[i].size < 65536 ? (size_t)list[i].size : 65536;
+      char *js = (char *)malloc(want);
+      if (js) {
+        if (pkg_read_cb(pkg, list[i].file_id, 0, js, want) == (int)want &&
+            !pfs_param_title_id(js, want, tid, sizeof(tid))) tid[0] = 0;
+        free(js);
+      }
+      break;
+    }
+    if (!tid[0]) { /* no title id in the package's param.json: take it from the file name */
+      const char *b = strrchr(pkg_path, '/');
+      if (!pfs_stem_title_id(b ? b + 1 : pkg_path, tid)) tid[0] = 0;
+    }
+  }
   int ret = is_exfat
     ? convert_listing_to_exfat(list, n, &ops, pkg, target_file, progress_cb, cancel_cb,
                                user_data, err_msg, err_len)
-    : convert_listing_to_ffpfsc(list, n, &ops, pkg, target_file, progress_cb, cancel_cb,
-                                user_data, err_msg, err_len);
+    : convert_listing_to_ffpfsc_ex(list, n, &ops, pkg, target_file, tid, progress_cb, cancel_cb,
+                                   user_data, err_msg, err_len);
   free(list);
   pkgr_close(pkg);
   return ret;
