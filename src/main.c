@@ -116,6 +116,8 @@ handle_client(void *arg) {
   int fd = (int)(intptr_t)arg;
   wup_frame_t frame;
   char payload[8192];
+  memset(&frame, 0, sizeof(frame));
+  memset(payload, 0, sizeof(payload));
   client_context_t ctx;
   ctx.fd = fd;
   ctx.request_id = 0;
