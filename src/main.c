@@ -25,6 +25,12 @@ static void handle_signal(int sig) {
 #define FLAG_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define FLAG_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 
+/* Volatile stores so the compiler cannot elide the wipe of secrets (passcodes). */
+static void scrub_bytes(void *p, size_t n) {
+  volatile unsigned char *v = (volatile unsigned char *)p;
+  while (n--) *v++ = 0;
+}
+
 typedef struct client_context {
   int fd;
   pthread_mutex_t send_lock;
@@ -289,9 +295,15 @@ handle_client(void *arg) {
           passcode = third_nl + 1;
         }
       }
+      /* Keep the passcode only in a local copy; wipe the receive buffer now so no rejection or
+       * allocation-failure path below can leave it behind. */
+      char pc[64];
+      snprintf(pc, sizeof(pc), "%s", passcode);
+      scrub_bytes(passcode, strlen(passcode));
 
       if (!is_safe_path(src_path) || !is_safe_path(dst_path)) {
         const char *err = "Invalid or disallowed path";
+        scrub_bytes(pc, sizeof(pc));
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -299,6 +311,7 @@ handle_client(void *arg) {
       worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
       if (!job) {
         const char *err = "Out of memory";
+        scrub_bytes(pc, sizeof(pc));
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -308,9 +321,8 @@ handle_client(void *arg) {
       strncpy(job->source, src_path, sizeof(job->source) - 1);
       strncpy(job->destination, dst_path, sizeof(job->destination) - 1);
       strncpy(job->format, fmt_str, sizeof(job->format) - 1);
-      strncpy(job->passcode, passcode, sizeof(job->passcode) - 1);
-      /* scrub the passcode from the receive buffer */
-      memset(passcode, 0, strlen(passcode));
+      snprintf(job->passcode, sizeof(job->passcode), "%s", pc);
+      scrub_bytes(pc, sizeof(pc));
 
       /* join the previous (finished) worker so its thread resources are released */
       if (have_worker) {
@@ -360,6 +372,12 @@ handle_client(void *arg) {
 int main(void) {
   int server_fd;
   struct sockaddr_un addr;
+  const char *path = sock_path();
+
+  if (strlen(path) >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "socket path too long (max %zu): %s\n", sizeof(addr.sun_path) - 1, path);
+    return 1;
+  }
 
   /* Prevent process termination when writing to closed sockets */
   signal(SIGPIPE, SIG_IGN);
@@ -377,7 +395,7 @@ int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
   }
 
-  unlink(sock_path());
+  unlink(path);
   server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (server_fd < 0) {
     perror("socket");
@@ -386,7 +404,7 @@ int main(void) {
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, sock_path(), sizeof(addr.sun_path) - 1);
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 #ifndef __linux__
   addr.sun_len = (unsigned char)SUN_LEN(&addr);
   socklen_t addr_len = addr.sun_len;
@@ -400,7 +418,7 @@ int main(void) {
     return 1;
   }
 
-  chmod(sock_path(), 0770);
+  chmod(path, 0770);
 
   if (listen(server_fd, 8) < 0) {
     perror("listen");
@@ -408,7 +426,7 @@ int main(void) {
     return 1;
   }
 
-  printf("wfm-ultrapack-helper listening on %s\n", sock_path());
+  printf("wfm-ultrapack-helper listening on %s\n", path);
 
   while (g_running) {
     int client_fd = accept(server_fd, NULL, NULL);
@@ -422,7 +440,7 @@ int main(void) {
   }
 
   close(server_fd);
-  unlink(sock_path());
+  unlink(path);
   if (log_fp) fclose(log_fp);
   return 0;
 }

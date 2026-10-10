@@ -196,6 +196,13 @@ async function main() {
     fs.writeFileSync(smallImg, imgData);
 
     // ---------- protocol-level errors ----------
+    await test('overlong WUP_SOCKET is rejected before binding', async () => {
+      const long = '/tmp/' + 'x'.repeat(200) + '.sock';
+      const r = spawnSync(BIN, [], { env: { ...process.env, WUP_SOCKET: long }, encoding: 'utf8', timeout: 10000 });
+      assert.strictEqual(r.status, 1, 'daemon must exit 1, got ' + r.status);
+      assert.match(r.stderr, /socket path too long/);
+      assert.ok(!fs.existsSync(long.slice(0, 107)), 'no truncated socket may be left behind');
+    });
     await test('ping/pong', async () => {
       const c = new Client(); await c.ready();
       c.send(frame(T.PING, 5));
