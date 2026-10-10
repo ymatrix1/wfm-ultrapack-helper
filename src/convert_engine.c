@@ -1,5 +1,10 @@
 #include "convert_engine.h"
 #include "pkg_reader.h"
+#include <time.h>
+#ifndef __linux__
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,6 +165,45 @@ typedef struct pfsc_sink {
   uint32_t next_emit;   /* next block to be written to disk */
 } pfsc_sink_t;
 
+static double mono_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* CPUs this process may actually run on. On the console a payload can be confined to few cores while
+ * sysconf still reports all of them, so extra compressor threads would only share one core.
+ * Best effort: try to widen the affinity to every online CPU, then report what we got. */
+static int pfsc_usable_cpus(long online) {
+  if (online < 1) online = 1;
+#ifndef __linux__
+  if (online > CPU_SETSIZE) online = CPU_SETSIZE;
+  cpuset_t cur, want;
+  int before = -1, after = -1, setrc = 0, seterr = 0;
+  if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cur), &cur) == 0) {
+    before = 0;
+    for (long i = 0; i < online; i++) if (CPU_ISSET(i, &cur)) before++;
+  }
+  if (before < online) {
+    CPU_ZERO(&want);
+    for (long i = 0; i < online; i++) CPU_SET(i, &want);
+    setrc = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(want), &want);
+    seterr = setrc ? errno : 0;
+    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cur), &cur) == 0) {
+      after = 0;
+      for (long i = 0; i < online; i++) if (CPU_ISSET(i, &cur)) after++;
+    }
+  } else {
+    after = before;
+  }
+  fprintf(stderr, "[pfsc] cpus online=%ld allowed_before=%d widen_rc=%d errno=%d allowed_after=%d\n",
+          online, before, setrc, seterr, after);
+  if (after > 0) return after;
+  if (before > 0) return before;
+#endif
+  return (int)online;
+}
+
 static int pfsc_thread_count(void) {
   const char *e = getenv("WUP_THREADS");
   long n = 0;
@@ -169,7 +213,7 @@ static int pfsc_thread_count(void) {
     if (end == e || n < 1) n = 0;
   }
   if (n == 0) {
-    long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long cpu = pfsc_usable_cpus(sysconf(_SC_NPROCESSORS_ONLN));
     n = cpu - 1;
     if (n > 8) n = 8;
     if (n < 1) n = 1;
@@ -481,6 +525,9 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
   int ret = pfsc_sink_begin(total_input_size, s);
   uint64_t done = 0;
+  double t_start = mono_s(), t_read = 0, t_sink = 0, t_mark = t_start;
+  uint64_t next_report = (uint64_t)4 << 30;
+  fprintf(stderr, "[pfsc] image start: %llu bytes, threads=%d\n", (unsigned long long)total_input_size, s->nthreads);
   while (ret == 0 && done < total_input_size) {
     if (cancel_cb && cancel_cb(user_data)) {
       snprintf(s->err, sizeof(s->err), "Conversion cancelled by user");
@@ -488,15 +535,26 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
       break;
     }
     uint64_t want = total_input_size - done;
+    double t0 = mono_s();
     size_t n = fread(chunk, 1, want < PFSC_IMAGE_CHUNK ? (size_t)want : PFSC_IMAGE_CHUNK, fin);
+    t_read += mono_s() - t0;
     if (n == 0) {
       if (ferror(fin)) snprintf(s->err, sizeof(s->err), "Error reading source image: %s", strerror(errno));
       else snprintf(s->err, sizeof(s->err), "Source image shrank while converting");
       ret = -1;
       break;
     }
+    double t1 = mono_s();
     if (pfsc_sink_write(chunk, n, s) != 0) { ret = -1; break; }
+    t_sink += mono_s() - t1;
     done += n;
+    if (done >= next_report) {
+      double now = mono_s();
+      fprintf(stderr, "[pfsc] %.1f GB done, %.0f MB/s overall | read %.0fs sink(compress+write) %.0fs of %.0fs\n",
+              (double)done / 1e9, (double)done / 1e6 / (now - t_start), t_read, t_sink, now - t_start);
+      (void)t_mark;
+      next_report += (uint64_t)4 << 30;
+    }
     if (progress_cb) progress_cb(total_input_size, done, user_data);
   }
   if (ret == 0 && pfsc_sink_finish(s) != 0) ret = -1;
