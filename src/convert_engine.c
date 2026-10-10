@@ -482,8 +482,7 @@ int run_conversion_ex(const char *source_path, const char *dest_path, const char
 
   /* Sanitize source name: strip trailing slashes */
   char sanitized_source[4096];
-  strncpy(sanitized_source, source_path, sizeof(sanitized_source) - 1);
-  sanitized_source[sizeof(sanitized_source) - 1] = '\0';
+  snprintf(sanitized_source, sizeof(sanitized_source), "%s", source_path);
   size_t slen = strlen(sanitized_source);
   while (slen > 1 && sanitized_source[slen - 1] == '/') {
     sanitized_source[slen - 1] = '\0';
@@ -495,8 +494,7 @@ int run_conversion_ex(const char *source_path, const char *dest_path, const char
   base = base ? base + 1 : sanitized_source;
 
   char clean_name[256];
-  strncpy(clean_name, base, sizeof(clean_name) - 1);
-  clean_name[sizeof(clean_name) - 1] = '\0';
+  snprintf(clean_name, sizeof(clean_name), "%s", base); /* bounded, always terminated */
 
   /* Only strip recognized image/pkg file extension if regular file */
   if (!S_ISDIR(st.st_mode)) {

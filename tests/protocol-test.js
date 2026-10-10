@@ -247,7 +247,7 @@ function testWorkerPasscodeClearing() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wfm-worker-'));
   try {
     const exe = path.join(tmpDir, 'worker_driver');
-    const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Wno-sign-compare',
+    const cc = spawnSync('gcc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Wno-sign-compare',
       '-pthread', path.join(__dirname, 'worker_driver.c'), '-o', exe], { encoding: 'utf8' });
     assert.strictEqual(cc.status, 0, cc.stdout + cc.stderr);
     const result = spawnSync(exe, [], { encoding: 'utf8', timeout: 10000 });

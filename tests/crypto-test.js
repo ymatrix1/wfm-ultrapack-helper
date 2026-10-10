@@ -9,7 +9,7 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-crypto-'));
 const exe = path.join(tmp, 'crypto_driver' + (process.platform === 'win32' ? '.exe' : ''));
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
+const cc = spawnSync('gcc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
   path.join(__dirname, 'crypto_driver.c'), path.join(root, 'src', 'crypto.c'), '-o', exe],
   { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }
@@ -134,7 +134,9 @@ const bm = /^MBPS ([0-9.]+)$/.exec(lines[jobs.length] || '');
 check('bench output present', !!bm, true);
 const mbps = bm ? parseFloat(bm[1]) : 0;
 console.log(`XTS decrypt speed: ${mbps.toFixed(1)} MB/s (64 MiB, 0x1000 sectors)`);
-check('speed > 20 MB/s', mbps > 20, true);
+// Sanitizer builds are 10-50x slower; the throughput floor only makes sense for plain builds.
+const sanitized = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
+if (!sanitized) check('speed > 20 MB/s', mbps > 20, true);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`crypto tests: ${passed} passed, ${failed} failed`);

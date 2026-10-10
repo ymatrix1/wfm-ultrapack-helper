@@ -20,6 +20,11 @@ static void handle_signal(int sig) {
   g_running = 0;
 }
 
+/* is_busy / cancel_requested are shared between the client thread and the conversion worker.
+ * Release/acquire gives the worker's last use of the context a happens-before edge to teardown. */
+#define FLAG_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define FLAG_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+
 typedef struct client_context {
   int fd;
   pthread_mutex_t send_lock;
@@ -162,7 +167,7 @@ static void on_convert_progress(uint64_t total, uint64_t done, void *user_data) 
 
 static bool check_cancel(void *user_data) {
   worker_job_t *job = (worker_job_t *)user_data;
-  return job->ctx->cancel_requested;
+  return FLAG_LOAD(&job->ctx->cancel_requested);
 }
 
 static bool is_safe_path(const char *path) {
@@ -179,6 +184,15 @@ static bool is_safe_path(const char *path) {
     return true;
   }
   return false;
+}
+
+/* Socket path: WUP_SOCKET overrides the default on Linux (tests, parallel runs). */
+static const char *sock_path(void) {
+#ifdef __linux__
+  const char *e = getenv("WUP_SOCKET");
+  if (e && *e) return e;
+#endif
+  return WUP_HELPER_SOCKET;
 }
 
 static void *conversion_worker_thread(void *arg) {
@@ -203,7 +217,7 @@ static void *conversion_worker_thread(void *arg) {
     send_frame_locked(job->ctx, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
   }
 
-  job->ctx->is_busy = false;
+  FLAG_STORE(&job->ctx->is_busy, false);
   free(job);
   return NULL;
 }
@@ -231,6 +245,7 @@ handle_client(void *arg) {
   ctx->is_busy = false;
   ctx->last_progress_time_ms = 0;
   pthread_t worker_tid = 0;
+  bool have_worker = false;
 
   while (g_running) {
     int ret = recv_frame(fd, &frame, &payload, &payload_cap);
@@ -239,12 +254,12 @@ handle_client(void *arg) {
     if (frame.type == WUP_MSG_PING) {
       send_frame_locked(ctx, WUP_MSG_PONG, frame.request_id, NULL, 0);
     } else if (frame.type == WUP_MSG_STATUS) {
-      const char *st = ctx->is_busy ? "busy" : "idle";
+      const char *st = FLAG_LOAD(&ctx->is_busy) ? "busy" : "idle";
       send_frame_locked(ctx, WUP_MSG_STATUS, frame.request_id, st, (uint32_t)strlen(st));
     } else if (frame.type == WUP_MSG_CANCEL) {
-      ctx->cancel_requested = true;
+      FLAG_STORE(&ctx->cancel_requested, true);
     } else if (frame.type == WUP_MSG_CONVERT) {
-      if (ctx->is_busy) {
+      if (FLAG_LOAD(&ctx->is_busy)) {
         const char *err = "Conversion already in progress";
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
@@ -297,8 +312,13 @@ handle_client(void *arg) {
       /* scrub the passcode from the receive buffer */
       memset(passcode, 0, strlen(passcode));
 
-      ctx->cancel_requested = false;
-      ctx->is_busy = true;
+      /* join the previous (finished) worker so its thread resources are released */
+      if (have_worker) {
+        pthread_join(worker_tid, NULL);
+        have_worker = false;
+      }
+      FLAG_STORE(&ctx->cancel_requested, false);
+      FLAG_STORE(&ctx->is_busy, true);
       ctx->last_progress_time_ms = 0;
       send_frame_locked(ctx, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
@@ -309,12 +329,13 @@ handle_client(void *arg) {
 
       if (pthread_create(&worker_tid, &attr, conversion_worker_thread, job) != 0) {
         pthread_attr_destroy(&attr);
-        ctx->is_busy = false;
+        FLAG_STORE(&ctx->is_busy, false);
         free(job);
         const char *err = "Failed to spawn conversion thread";
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
       } else {
         pthread_attr_destroy(&attr);
+        have_worker = true;
       }
     } else {
       /* Unknown frame type */
@@ -324,8 +345,8 @@ handle_client(void *arg) {
   }
 
   /* If client disconnected mid-task, cancel active worker and join it */
-  ctx->cancel_requested = true;
-  if (ctx->is_busy) {
+  FLAG_STORE(&ctx->cancel_requested, true);
+  if (have_worker) {
     pthread_join(worker_tid, NULL);
   }
 
@@ -356,7 +377,7 @@ int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
   }
 
-  unlink(WUP_HELPER_SOCKET);
+  unlink(sock_path());
   server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (server_fd < 0) {
     perror("socket");
@@ -365,7 +386,7 @@ int main(void) {
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, WUP_HELPER_SOCKET, sizeof(addr.sun_path) - 1);
+  strncpy(addr.sun_path, sock_path(), sizeof(addr.sun_path) - 1);
 #ifndef __linux__
   addr.sun_len = (unsigned char)SUN_LEN(&addr);
   socklen_t addr_len = addr.sun_len;
@@ -379,7 +400,7 @@ int main(void) {
     return 1;
   }
 
-  chmod(WUP_HELPER_SOCKET, 0770);
+  chmod(sock_path(), 0770);
 
   if (listen(server_fd, 8) < 0) {
     perror("listen");
@@ -387,7 +408,7 @@ int main(void) {
     return 1;
   }
 
-  printf("wfm-ultrapack-helper listening on %s\n", WUP_HELPER_SOCKET);
+  printf("wfm-ultrapack-helper listening on %s\n", sock_path());
 
   while (g_running) {
     int client_fd = accept(server_fd, NULL, NULL);
@@ -401,7 +422,7 @@ int main(void) {
   }
 
   close(server_fd);
-  unlink(WUP_HELPER_SOCKET);
+  unlink(sock_path());
   if (log_fp) fclose(log_fp);
   return 0;
 }

@@ -9,6 +9,13 @@ HOST_CC ?= cc
 CFLAGS := -O2 -Wall -Wextra -pthread -Isrc
 LDFLAGS := -pthread
 
+# Sanitizer builds: make linux SAN=address,undefined   or   make linux SAN=thread
+SAN ?=
+ifneq ($(SAN),)
+CFLAGS += -fsanitize=$(SAN) -fno-omit-frame-pointer -g
+LDFLAGS += -fsanitize=$(SAN)
+endif
+
 # If PS5_PAYLOAD_SDK is set, include prospero.mk for ps5 or default goals
 ifdef PS5_PAYLOAD_SDK
   ifeq ($(filter linux clean,$(MAKECMDGOALS)),)

@@ -16,7 +16,9 @@ if (process.platform !== 'linux') {
 
 const ROOT = path.resolve(__dirname, '..');
 const BIN = path.join(ROOT, 'wfm-ultrapack-helper-linux');
-const SOCK = '/tmp/wfm-ultrapack-helper.sock';
+const SOCK = process.env.WUP_SOCKET || '/tmp/wfm-ultrapack-helper.sock';
+// ASAN/UBSAN/TSAN builds run 5-50x slower: scale frame-wait timeouts.
+const SANITIZED = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
 const HEADER = 20;
 const T = { PING: 1, PONG: 2, CONVERT: 10, CANCEL: 11, STATUS: 12, ACCEPTED: 20, PROGRESS: 21, DONE: 24, ERROR: 25 };
 
@@ -54,7 +56,7 @@ class Client {
   wake() { this.waiters.splice(0).forEach(w => w()); }
   ready() { return new Promise((res, rej) => { this.sock.once('connect', res); this.sock.once('error', rej); }); }
   send(buf) { this.sock.write(buf); }
-  async until(pred, ms = 20000) {
+  async until(pred, ms = SANITIZED ? 600000 : 20000) {
     const end = Date.now() + ms;
     for (;;) {
       const f = this.frames.find(pred);

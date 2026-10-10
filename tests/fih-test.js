@@ -19,7 +19,7 @@ const PKG = process.env.GT7_PKG_PATH || '/data/homebrew/UP9000-PPSA01317_00-GRAN
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-fih-'));
 const exe = path.join(tmp, 'fih_driver' + (process.platform === 'win32' ? '.exe' : ''));
 const srcs = ['pkg_reader.c', 'fih_reader.c', 'kraken.c', 'crypto.c', 'miniz.c', 'rsa.c'].map((f) => path.join(root, 'src', f));
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-I', path.join(root, 'src'), '-I', __dirname,
+const cc = spawnSync('gcc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Werror', '-I', path.join(root, 'src'), '-I', __dirname,
   path.join(__dirname, 'fih_driver.c'), path.join(__dirname, 'http_range.c'), ...srcs, '-o', exe,
   ...(process.platform === 'win32' ? ['-lws2_32'] : [])], { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }

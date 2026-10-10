@@ -10,7 +10,7 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-rsa-'));
 const exe = path.join(tmp, 'rsa_driver' + (process.platform === 'win32' ? '.exe' : ''));
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
+const cc = spawnSync('gcc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
   path.join(__dirname, 'rsa_driver.c'), path.join(root, 'src', 'rsa.c'), path.join(root, 'src', 'crypto.c'), '-o', exe],
   { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }
