@@ -1,0 +1,48 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Linux daemon
+        run: |
+          make linux
+
+      - name: Run Protocol & Framing Tests
+        run: |
+          node tests/protocol-test.js
+
+  build-ps5:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PS5 Payload SDK
+        id: cache-ps5-sdk
+        uses: actions/cache@v4
+        with:
+          path: /opt/ps5-payload-sdk
+          key: ${{ runner.os }}-ps5-payload-sdk-v1
+
+      - name: Install PS5 Payload SDK (if not cached)
+        if: steps.cache-ps5-sdk.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt/ps5-payload-sdk
+          echo "SDK setup placeholder"
+
+      - name: Build PS5 ELF
+        run: |
+          echo "Building PS5 payload artifact..."

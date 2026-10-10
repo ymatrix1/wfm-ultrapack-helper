@@ -1,39 +1,92 @@
 # wfm-ultrapack-helper
 
-Standalone PS5 companion helper daemon for **PS5 Web File Manager** providing high-performance game format conversions:
-- **`.pkg` (fPKG) -> `.ffpfsc`** (compressed PFS container for ShadowMountPlus)
-- **`.ffpfsc` -> `.pkg`**
-- **Direct extraction / packing** without redundant disk round-trips.
+Standalone high-performance PS5 companion helper daemon for [PS5 Web File Manager](https://github.com/owendswang/ps5-web-file-manager). It brings the game format conversion and packaging features of [PS5 UltraPack](https://github.com/owendswang/ps5-web-file-manager) directly to the console with minimal temporary disk usage.
 
-## Architecture
+## Highlights & Zero-Staging Architecture
 
-This daemon runs alongside `web-file-mgr.elf` on the PS5.
-- It listens on UNIX domain socket `/system_tmp/wfm-ultrapack-helper.sock` (or `/tmp/wfm-ultrapack-helper.sock` on Linux).
-- It can be auto-launched by PS5 Web File Manager via `localhost:9021` (elfldr) from `/data/wfm/wfm-ultrapack-helper.elf`.
-- Uses frame-based communication (`WUPH` header magic) with non-blocking streaming progress and cancellation.
+- **Zero intermediate extraction (Minimal Disk Footprint):**
+  - Traditional tools unpack a 50–100 GB game to disk, modify files, and re-pack to another image, multiplying free space requirements (up to 3×–4× disk space).
+  - `wfm-ultrapack-helper` reads the inner PPR-PFS filesystem via random-access NAPS block streaming (`InnerImage` plan).
+  - Streams blocks directly from the `.pkg` into the compressed PFS `.ffpfsc` encoder in 64 KiB chunks—**requiring only the final output file's disk space**.
+- **Supported Formats:**
+  - `.pkg` (fPKG) ➔ `.ffpfsc` (compressed container for ShadowMountPlus)
+  - `.ffpfsc` / `.ffpfs` ➔ `.pkg`
+  - `.pkg` / `.ffpfsc` ➔ `/app0` folder
+- **Auto-organization & naming:**
+  - Automatically identifies title ID, title name, app version, and minimum firmware tag:
+    `<Title> [<TitleID>] [v<Version>] [fw<FW>].ffpfsc`
+- **Non-blocking Daemon:**
+  - Listens on UNIX domain socket `/system_tmp/wfm-ultrapack-helper.sock` (or `/tmp/wfm-ultrapack-helper.sock` on Linux).
+  - Real-time progress, speed, ETA, and cooperative cancellation (`WUP_MSG_CANCEL`).
 
-## Conversion Pipeline: PKG to FFPFSC
+---
 
-1. **Outer PKG / CNT Parser:**
-   - Reads CNT header and entry table (param.json, icon0.png).
-   - Resolves outer PFS to locate `pfs_image.dat` and `naps_pkg_layout.dat`.
-2. **Inner Image Streaming:**
-   - Mounts/decodes NAPS Kraken spans on-the-fly.
-   - Streams logical inner PFS blocks into the PFS compression writer (zlib level 1-9) in 64 KiB blocks.
-3. **Outer PFS Wrap:**
-   - Assembles outer PFS with ShadowMountPlus metadata headers.
-   - Emits finished `<Title> [TITLEID] [vXX.YYY] [fwN.NN].ffpfsc`.
+## Zero-Staging Pipeline: PKG ➔ FFPFSC
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Source .pkg (fPKG) on /user/home or /mnt/usb0         │
+└───────────────────────────┬────────────────────────────┘
+                            │
+               1. Parse CNT & Outer Superblock
+               2. Parse NAPS Layout & Inner PPR-PFS
+                            │
+┌───────────────────────────▼────────────────────────────┐
+│  Direct Block Streaming Engine (In-Memory 32 MiB span) │
+│  - Decodes Kraken / stored spans on the fly            │
+│  - Reconstructs dirents & ampr_emu.index               │
+│  - Feeds PFS zlib block compressor (level 1-9)         │
+└───────────────────────────┬────────────────────────────┘
+                            │
+               3. Assemble Outer PFS Header & Inodes
+               4. Stream directly to target storage
+                            │
+┌───────────────────────────▼────────────────────────────┐
+│  Destination .ffpfsc (ShadowMountPlus Ready)           │
+│  Disk space used: ~1x output only (no scratch copy)    │
+└────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Building
 
-Requires the PS5 Payload SDK:
+### PS5 Native ELF (via PS5 Payload SDK)
+Ensure you have the [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) installed:
 ```bash
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-make
+make ps5
 ```
+Output: `wfm-ultrapack-helper.elf`
 
-For local Linux testing:
+Deploy the binary to your console at:
+```text
+/data/wfm/wfm-ultrapack-helper.elf
+```
+PS5 Web File Manager will automatically detect and boot the helper daemon via `localhost:9021` when a conversion task begins.
+
+### Linux Testing Build
+For running the test harness and verifying server behavior on Linux/macOS:
 ```bash
 make linux
 ./wfm-ultrapack-helper-linux
 ```
+
+---
+
+## Testing & Quality Assurance
+
+Run the protocol framing and streaming tests:
+```bash
+npm test
+```
+Or directly with Node.js (no dependencies required):
+```bash
+node tests/protocol-test.js
+```
+
+---
+
+## License
+
+This project is licensed under GPLv3. Third-party components retain their respective licenses (LibProsperoPkg / LibOrbisPkg GPL-3.0).
