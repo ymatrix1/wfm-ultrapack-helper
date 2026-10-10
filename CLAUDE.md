@@ -38,6 +38,8 @@ Guidelines and architecture instructions for `wfm-ultrapack-helper`.
 - `src/miniz.c` & `src/miniz.h`: Standalone amalgamated zlib library.
 - `src/protocol.h`: Wire protocol framing and constants.
 
+- `tests/shadowmount-check.js` + `tests/shadowmount-compat-test.js`: offline copy of the checks ShadowMountPlus (GPL-3.0, drakmor/shadowMountPlus) applies before registering a game: nested exFAT cluster size >= device sector (64 KiB recommended), PFS container shape, `sce_sys/param.json` rules (1 B..1 MiB, strict JSON object, titleId PPSA|CUSA|LAPY|FAKE + 5 digits). `node tests/shadowmount-check.js <file>` checks a real image.
+
 ## Code Conventions
 - Strict C99 with POSIX extensions.
 - Heap allocate large buffers (never place 64 KiB+ buffers on pthread worker stacks).

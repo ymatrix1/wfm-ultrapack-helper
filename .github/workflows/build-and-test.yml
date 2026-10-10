@@ -43,6 +43,10 @@ jobs:
         run: |
           node tests/e2e-test.js
 
+      - name: Run ShadowMountPlus compatibility checks
+        run: |
+          node tests/shadowmount-compat-test.js
+
       - name: Run Crypto Tests
         run: |
           node tests/crypto-test.js
@@ -100,7 +104,7 @@ jobs:
       - name: Run all suites on instrumented builds
         run: |
           status=0
-          for t in protocol-test e2e-test mt-test crypto-test rsa-test listing-test pkg-test fih-test; do
+          for t in protocol-test e2e-test shadowmount-compat-test mt-test crypto-test rsa-test listing-test pkg-test fih-test; do
             echo "::group::$t"
             rm -f /tmp/san/*
             ${{ matrix.run_prefix }} node tests/$t.js || status=1
