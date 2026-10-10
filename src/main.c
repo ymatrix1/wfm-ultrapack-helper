@@ -349,8 +349,14 @@ int main(void) {
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, WUP_HELPER_SOCKET, sizeof(addr.sun_path) - 1);
+#ifndef __linux__
+  addr.sun_len = (unsigned char)SUN_LEN(&addr);
+  socklen_t addr_len = addr.sun_len;
+#else
+  socklen_t addr_len = sizeof(addr);
+#endif
 
-  if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (bind(server_fd, (struct sockaddr *)&addr, addr_len) < 0) {
     perror("bind");
     close(server_fd);
     return 1;
