@@ -177,27 +177,39 @@ static double mono_s(void) {
 static int pfsc_usable_cpus(long online) {
   if (online < 1) online = 1;
 #ifndef __linux__
-  if (online > CPU_SETSIZE) online = CPU_SETSIZE;
-  cpuset_t cur, want;
+  /* The kernel's cpuset is larger than the SDK's cpuset_t (getaffinity fails with ERANGE), so probe
+   * increasing buffer sizes and treat the set as a raw little-endian bitmap. */
+  enum { MAXBUF = 1024 };
+  unsigned char cur[MAXBUF], want[MAXBUF];
+  static const size_t sizes[] = {8, 16, 32, 64, 128, 256, 512, 1024};
+  size_t len = 0;
+  int last_errno = 0;
+  if (online > MAXBUF * 8) online = MAXBUF * 8;
+  for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]) && !len; k++) {
+    memset(cur, 0, sizeof(cur));
+    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizes[k], (cpuset_t *)(void *)cur) == 0) len = sizes[k];
+    else last_errno = errno;
+  }
   int before = -1, after = -1, setrc = 0, seterr = 0;
-  if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cur), &cur) == 0) {
+  if (len) {
     before = 0;
-    for (long i = 0; i < online; i++) if (CPU_ISSET(i, &cur)) before++;
-  }
-  if (before < online) {
-    CPU_ZERO(&want);
-    for (long i = 0; i < online; i++) CPU_SET(i, &want);
-    setrc = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(want), &want);
-    seterr = setrc ? errno : 0;
-    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cur), &cur) == 0) {
-      after = 0;
-      for (long i = 0; i < online; i++) if (CPU_ISSET(i, &cur)) after++;
+    for (long i = 0; i < online; i++) if (cur[i / 8] & (1u << (i % 8))) before++;
+    if (before < online) {
+      memset(want, 0, sizeof(want));
+      for (long i = 0; i < online; i++) want[i / 8] |= (unsigned char)(1u << (i % 8));
+      setrc = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, len, (const cpuset_t *)(const void *)want);
+      seterr = setrc ? errno : 0;
+      memset(cur, 0, sizeof(cur));
+      if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, len, (cpuset_t *)(void *)cur) == 0) {
+        after = 0;
+        for (long i = 0; i < online; i++) if (cur[i / 8] & (1u << (i % 8))) after++;
+      }
+    } else {
+      after = before;
     }
-  } else {
-    after = before;
   }
-  fprintf(stderr, "[pfsc] cpus online=%ld allowed_before=%d widen_rc=%d errno=%d allowed_after=%d\n",
-          online, before, setrc, seterr, after);
+  fprintf(stderr, "[pfsc] cpus online=%ld setlen=%zu get_errno=%d allowed_before=%d widen_rc=%d widen_errno=%d allowed_after=%d\n",
+          online, len, last_errno, before, setrc, seterr, after);
   if (after > 0) return after;
   if (before > 0) return before;
 #endif
