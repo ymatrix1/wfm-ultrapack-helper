@@ -1,13 +1,19 @@
-name: Build & Test
+name: Build, Test & Release
 
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   test:
+    name: Test & Build Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,28 +27,41 @@ jobs:
         run: |
           make linux
 
-      - name: Run Protocol & Framing Tests
+      - name: Run Protocol & Integration Tests
         run: |
           node tests/protocol-test.js
 
-  build-ps5:
+      - name: Upload Linux Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wfm-ultrapack-helper-linux
+          path: wfm-ultrapack-helper-linux
+
+  release:
+    name: Auto Release
+    needs: [ test ]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache PS5 Payload SDK
-        id: cache-ps5-sdk
-        uses: actions/cache@v4
+      - name: Download Linux Binary
+        uses: actions/download-artifact@v4
         with:
-          path: /opt/ps5-payload-sdk
-          key: ${{ runner.os }}-ps5-payload-sdk-v1
+          name: wfm-ultrapack-helper-linux
 
-      - name: Install PS5 Payload SDK (if not cached)
-        if: steps.cache-ps5-sdk.outputs.cache-hit != 'true'
+      - name: Package Release Assets
         run: |
-          sudo mkdir -p /opt/ps5-payload-sdk
-          echo "SDK setup placeholder"
+          chmod +x wfm-ultrapack-helper-linux
+          tar -czvf wfm-ultrapack-helper-linux.tar.gz wfm-ultrapack-helper-linux
 
-      - name: Build PS5 ELF
-        run: |
-          echo "Building PS5 payload artifact..."
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            wfm-ultrapack-helper-linux.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
