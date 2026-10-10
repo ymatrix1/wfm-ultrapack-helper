@@ -15,7 +15,7 @@ const PKGS = ['PS5_LAPY20012_v1.00.pkg', 'PS5_ITEM00001_v1.14.pkg'];
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-pkg-'));
 const exe = path.join(tmp, 'pkg_driver' + (process.platform === 'win32' ? '.exe' : ''));
 const srcs = ['pkg_reader.c', 'fih_reader.c', 'kraken.c', 'crypto.c', 'miniz.c', 'rsa.c'].map((f) => path.join(root, 'src', f));
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
+const cc = spawnSync(process.env.HOST_CC || 'cc', ['-std=gnu99', '-O2', ...(process.env.EXTRA_CFLAGS ? process.env.EXTRA_CFLAGS.split(' ') : []), '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
   path.join(__dirname, 'pkg_driver.c'), ...srcs, '-o', exe], { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }
 

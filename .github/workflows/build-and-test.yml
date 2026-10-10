@@ -55,6 +55,64 @@ jobs:
         run: |
           node tests/listing-test.js
 
+  sanitizers:
+    name: Sanitizers (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASAN + UBSAN
+            san: address,undefined
+            run_prefix: ""
+          - name: TSAN
+            san: thread
+            run_prefix: "setarch x86_64 -R"
+    env:
+      SAN: ${{ matrix.san }}
+      EXTRA_CFLAGS: -fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g
+      WUP_SOCKET: /tmp/wup-sanitizer.sock
+      ASAN_OPTIONS: detect_leaks=0:log_path=/tmp/san/asan
+      UBSAN_OPTIONS: halt_on_error=0:print_stacktrace=1:log_path=/tmp/san/ubsan
+      TSAN_OPTIONS: halt_on_error=0:report_signal_unsafe=0:log_path=/tmp/san/tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exfatprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y exfatprogs
+
+      - name: Relax ASLR for ThreadSanitizer
+        if: matrix.san == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Build instrumented daemon
+        run: |
+          mkdir -p /tmp/san
+          make linux SAN=$SAN
+
+      - name: Run all suites on instrumented builds
+        run: |
+          status=0
+          for t in protocol-test e2e-test mt-test crypto-test rsa-test listing-test pkg-test fih-test; do
+            echo "::group::$t"
+            rm -f /tmp/san/*
+            ${{ matrix.run_prefix }} node tests/$t.js || status=1
+            if ls /tmp/san/* >/dev/null 2>&1; then
+              echo "::error::sanitizer reports during $t"
+              cat /tmp/san/* | head -80
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
   build-ps5:
     name: Build PS5 ELF
     runs-on: ubuntu-latest

@@ -414,9 +414,13 @@ typedef struct {
     int found;
 } outer_file_t;
 
+/* seen[]: one flag per outer inode. A directory inode may be visited once; a crafted image that
+ * lists the same directory under many parents would otherwise multiply the work per level. */
 static int outer_walk(fih_t *f, uint64_t base, const uint8_t *itab, uint64_t nino, uint32_t ino, int depth,
-                      outer_file_t *img, outer_file_t *lay) {
+                      uint8_t *seen, outer_file_t *img, outer_file_t *lay) {
     if (depth > 6 || ino >= nino) return -1;
+    if (seen[ino]) return -1;
+    seen[ino] = 1;
     const uint8_t *in = itab + (size_t)ino * 0x2C8;
     int32_t start = (int32_t)le32(in + 0x64 + 32);
     if (start < 0) return -1;
@@ -442,7 +446,7 @@ static int outer_walk(fih_t *f, uint64_t base, const uint8_t *itab, uint64_t nin
             if (l == 13 && !memcmp(nm, "pfs_image.dat", 13)) *img = t;
             else if (l == 19 && !memcmp(nm, "naps_pkg_layout.dat", 19)) *lay = t;
         } else if (typ == 3) {
-            if (outer_walk(f, base, itab, nino, i2, depth + 1, img, lay)) rc = -1;
+            if (outer_walk(f, base, itab, nino, i2, depth + 1, seen, img, lay)) rc = -1;
         }
         pos += es;
     }
@@ -748,7 +752,10 @@ int fih_open(const pkgr_io_t *io_in, fih_t **out, char *err, size_t errlen) {
         goto fail;
     }
     outer_file_t img = {0, 0, 0}, lf = {0, 0, 0};
-    if (outer_walk(f, pfs_off, itab, nino, 0, 0, &img, &lf) || !img.found || !lf.found) {
+    uint8_t *outer_seen = (uint8_t *)calloc((size_t)nino ? (size_t)nino : 1, 1);
+    int walk_rc = outer_seen ? outer_walk(f, pfs_off, itab, nino, 0, 0, outer_seen, &img, &lf) : -1;
+    free(outer_seen);
+    if (walk_rc || !img.found || !lf.found) {
         fail(err, errlen, "outer PFS lacks pfs_image.dat / naps_pkg_layout.dat");
         goto fail;
     }

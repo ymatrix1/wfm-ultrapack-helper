@@ -16,7 +16,9 @@ if (process.platform !== 'linux') {
 
 const ROOT = path.resolve(__dirname, '..');
 const BIN = path.join(ROOT, 'wfm-ultrapack-helper-linux');
-const SOCK = '/tmp/wfm-ultrapack-helper.sock';
+const SOCK = process.env.WUP_SOCKET || '/tmp/wfm-ultrapack-helper.sock';
+// Sanitizer builds distort timing: keep correctness checks, skip the speedup floor.
+const SANITIZED = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
 const HEADER = 20;
 const T = { PING: 1, PONG: 2, CONVERT: 10, CANCEL: 11, PROGRESS: 21, ACCEPTED: 20, DONE: 24, ERROR: 25 };
 const MB = 1024 * 1024;
@@ -239,6 +241,7 @@ ffpfsc`)));
       } finally { await stopDaemon(daemon); daemon = null; }
     });
     await test('image -> ffpfsc speed: 8 threads vs 1 thread', async () => {
+      if (SANITIZED) { console.log('       (speed test skipped under sanitizers)'); return; }
       const mb = parseInt(process.env.MT_SPEED_MB || '600', 10);
       const big = path.join(imgDir, 'speed.img');
       writeBig(big, mb, 5000, 'semi');
@@ -260,7 +263,7 @@ ffpfsc`)));
       }
       const ratio = rate[8] / rate[1];
       console.log(`       image speedup 8 vs 1: ${ratio.toFixed(2)}x (${os.cpus().length} CPUs)`);
-      if (os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x, got ${ratio.toFixed(2)}x`);
+      if (!SANITIZED && os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x, got ${ratio.toFixed(2)}x`);
       fs.unlinkSync(big);
     });
 
@@ -294,6 +297,7 @@ ffpfsc`)));
 
     // ---------- speed ----------
     await test('speed: 8 threads vs 1 thread', async () => {
+      if (SANITIZED) { console.log('       (speed test skipped under sanitizers)'); return; }
       const mb = parseInt(process.env.MT_SPEED_MB || '600', 10);
       const big = path.join(work, 'bigtree'); fs.mkdirSync(big);
       const per = 100;
@@ -317,7 +321,7 @@ ffpfsc`)));
       }
       const ratio = rate[8] / rate[1];
       console.log(`       speedup 8 vs 1: ${ratio.toFixed(2)}x (${os.cpus().length} CPUs)`);
-      if (os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x speedup, got ${ratio.toFixed(2)}x`);
+      if (!SANITIZED && os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x speedup, got ${ratio.toFixed(2)}x`);
       else console.log('       (fewer than 8 CPUs: speedup assertion skipped)');
       fs.rmSync(big, { recursive: true, force: true });
     });
