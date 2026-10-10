@@ -17,9 +17,6 @@ static double mono_s(void) {
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-/* Diagnostics only: wall time spent in fwrite and waiting for compressor threads (sink thread). */
-static double g_t_write = 0.0;
-static double g_t_wait = 0.0;
 #include <unistd.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -102,7 +99,7 @@ static size_t pfsc_compress_block(z_stream *strm, const uint8_t *in_buf, uint8_t
 
 /* Write an already compressed (or stored) block; advances *out_off. */
 static int pfsc_write_block(const uint8_t *in_buf, const uint8_t *out_buf, size_t sz, int stored,
-                            FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+                            FILE *fout, uint64_t *out_off, double *t_write, char *err_msg, size_t err_len) {
   double tw = mono_s();
   if (stored) {
     if (fwrite(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fout) != PFSC_LOGICAL_BLOCK_SIZE) {
@@ -113,17 +110,17 @@ static int pfsc_write_block(const uint8_t *in_buf, const uint8_t *out_buf, size_
     snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
     return -1;
   }
-  g_t_write += mono_s() - tw;
+  *t_write += mono_s() - tw;
   *out_off += sz;
   return 0;
 }
 
 /* Compress one full 64 KiB logical block (reusing strm) and write it; advances *out_off. */
 static int pfsc_emit_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_buf,
-                           FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+                           FILE *fout, uint64_t *out_off, double *t_write, char *err_msg, size_t err_len) {
   int stored;
   size_t sz = pfsc_compress_block(strm, in_buf, out_buf, &stored);
-  return pfsc_write_block(in_buf, out_buf, sz, stored, fout, out_off, err_msg, err_len);
+  return pfsc_write_block(in_buf, out_buf, sz, stored, fout, out_off, t_write, err_msg, err_len);
 }
 
 enum { SLOT_FREE = 0, SLOT_QUEUED, SLOT_DONE };
@@ -157,6 +154,8 @@ typedef struct pfsc_sink {
   z_stream strm;
   bool zinit;
   char err[256];
+  double t_write;  /* diagnostics: fwrite wall time (sink thread) */
+  double t_wait;   /* diagnostics: time waiting on compressors */
 
   /* Multithreaded mode (nthreads > 1): ring of slots, slot index = block sequence % nslots.
    * Only the sink thread fills slots (FREE -> QUEUED), writes output and frees them (DONE -> FREE);
@@ -331,6 +330,8 @@ static int pfsc_mt_start(pfsc_sink_t *s, int nthreads) {
 /* Called once with the exact image size: reserves header area and allocates state. */
 static int pfsc_sink_begin(uint64_t total_bytes, void *ctx) {
   pfsc_sink_t *s = (pfsc_sink_t *)ctx;
+  s->t_write = 0.0;
+  s->t_wait = 0.0;
   if (total_bytes == 0) {
     snprintf(s->err, sizeof(s->err), "Generated image is empty (0 bytes)");
     return -1;
@@ -392,7 +393,7 @@ static int pfsc_mt_try_emit(pfsc_sink_t *s) {
   if (sl->state != SLOT_DONE) return 0;
   pthread_mutex_unlock(&s->mu);
   s->offsets[s->next_emit] = s->cur_off;
-  int rc = pfsc_write_block(sl->in, sl->out, sl->sz, sl->stored, s->f, &s->cur_off, s->err, sizeof(s->err));
+  int rc = pfsc_write_block(sl->in, sl->out, sl->sz, sl->stored, s->f, &s->cur_off, &s->t_write, s->err, sizeof(s->err));
   pthread_mutex_lock(&s->mu);
   if (rc != 0) return -1;
   sl->state = SLOT_FREE;
@@ -413,7 +414,7 @@ static int pfsc_mt_acquire(pfsc_sink_t *s) {
     if (e < 0) { rc = -1; break; }
     if (e > 0) continue;
     if (s->slots[s->next_block % s->nslots].state == SLOT_FREE) break;
-    { double tc = mono_s(); pthread_cond_wait(&s->done_cv, &s->mu); g_t_wait += mono_s() - tc; }
+    { double tc = mono_s(); pthread_cond_wait(&s->done_cv, &s->mu); s->t_wait += mono_s() - tc; }
   }
   pthread_mutex_unlock(&s->mu);
   return rc;
@@ -439,7 +440,7 @@ static int pfsc_mt_drain(pfsc_sink_t *s) {
     }
     int e = pfsc_mt_try_emit(s);
     if (e < 0) { rc = -1; break; }
-    if (e == 0) { double tc = mono_s(); pthread_cond_wait(&s->done_cv, &s->mu); g_t_wait += mono_s() - tc; }
+    if (e == 0) { double tc = mono_s(); pthread_cond_wait(&s->done_cv, &s->mu); s->t_wait += mono_s() - tc; }
   }
   pthread_mutex_unlock(&s->mu);
   return rc;
@@ -457,7 +458,7 @@ static int pfsc_sink_flush_block(pfsc_sink_t *s) {
     return 0;
   }
   s->offsets[s->next_block] = s->cur_off;
-  if (pfsc_emit_block(&s->strm, s->in_buf, s->out_buf, s->f, &s->cur_off, s->err, sizeof(s->err)) != 0) {
+  if (pfsc_emit_block(&s->strm, s->in_buf, s->out_buf, s->f, &s->cur_off, &s->t_write, s->err, sizeof(s->err)) != 0) {
     return -1;
   }
   s->next_block++;
@@ -570,7 +571,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     if (done >= next_report) {
       double now = mono_s();
       fprintf(stderr, "[pfsc] %.1f GB done, %.0f MB/s overall | read %.0fs sink %.0fs (fwrite %.0fs, waiting on compressors %.0fs) of %.0fs\n",
-              (double)done / 1e9, (double)done / 1e6 / (now - t_start), t_read, t_sink, g_t_write, g_t_wait, now - t_start);
+              (double)done / 1e9, (double)done / 1e6 / (now - t_start), t_read, t_sink, s->t_write, s->t_wait, now - t_start);
       (void)t_mark;
       next_report += (uint64_t)4 << 30;
     }
