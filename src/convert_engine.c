@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "miniz.h"
 
 static void put32_le(uint8_t *p, uint32_t v) {
@@ -62,9 +63,10 @@ static int pfsc_write_header(FILE *fout, const uint64_t *offsets, uint32_t block
   return 0;
 }
 
-/* Compress one full 64 KiB logical block (reusing strm) and write it; advances *out_off. */
-static int pfsc_emit_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_buf,
-                           FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+/* Compress one full 64 KiB logical block (reusing strm). Returns the number of bytes the block
+ * occupies in the output and sets *stored when the raw block must be written instead (it did not
+ * shrink below 64 KiB, or deflate failed). */
+static size_t pfsc_compress_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_buf, int *stored) {
   deflateReset(strm);
   strm->avail_in = PFSC_LOGICAL_BLOCK_SIZE;
   strm->next_in = (Bytef *)in_buf;
@@ -75,20 +77,35 @@ static int pfsc_emit_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_b
   size_t comp_sz = (PFSC_LOGICAL_BLOCK_SIZE * 2) - strm->avail_out;
 
   if (ret != Z_STREAM_END || comp_sz >= PFSC_LOGICAL_BLOCK_SIZE) {
-    /* Store uncompressed block directly as a full 64 KiB block */
+    *stored = 1;
+    return PFSC_LOGICAL_BLOCK_SIZE;
+  }
+  *stored = 0;
+  return comp_sz;
+}
+
+/* Write an already compressed (or stored) block; advances *out_off. */
+static int pfsc_write_block(const uint8_t *in_buf, const uint8_t *out_buf, size_t sz, int stored,
+                            FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+  if (stored) {
     if (fwrite(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fout) != PFSC_LOGICAL_BLOCK_SIZE) {
       snprintf(err_msg, err_len, "Failed writing block to disk (disk full?): %s", strerror(errno));
       return -1;
     }
-    *out_off += PFSC_LOGICAL_BLOCK_SIZE;
-  } else {
-    if (fwrite(out_buf, 1, comp_sz, fout) != comp_sz) {
-      snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
-      return -1;
-    }
-    *out_off += comp_sz;
+  } else if (fwrite(out_buf, 1, sz, fout) != sz) {
+    snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
+    return -1;
   }
+  *out_off += sz;
   return 0;
+}
+
+/* Compress one full 64 KiB logical block (reusing strm) and write it; advances *out_off. */
+static int pfsc_emit_block(z_stream *strm, const uint8_t *in_buf, uint8_t *out_buf,
+                           FILE *fout, uint64_t *out_off, char *err_msg, size_t err_len) {
+  int stored;
+  size_t sz = pfsc_compress_block(strm, in_buf, out_buf, &stored);
+  return pfsc_write_block(in_buf, out_buf, sz, stored, fout, out_off, err_msg, err_len);
 }
 
 int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_path,
@@ -232,7 +249,23 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   return 0;
 }
 
+enum { SLOT_FREE = 0, SLOT_QUEUED, SLOT_DONE };
+
 typedef struct {
+  uint8_t *in;
+  uint8_t *out;
+  size_t sz;
+  int stored;
+  int state;
+} pfsc_slot_t;
+
+struct pfsc_sink;
+
+typedef struct {
+  struct pfsc_sink *s;
+} pfsc_worker_arg_t;
+
+typedef struct pfsc_sink {
   FILE *f;
   uint8_t *in_buf;
   uint8_t *out_buf;
@@ -247,14 +280,130 @@ typedef struct {
   z_stream strm;
   bool zinit;
   char err[256];
+
+  /* Multithreaded mode (nthreads > 1): ring of slots, slot index = block sequence % nslots.
+   * Only the sink thread fills slots (FREE -> QUEUED), writes output and frees them (DONE -> FREE);
+   * workers claim blocks in sequence order and mark them DONE. */
+  int nthreads;
+  int nstarted;
+  uint32_t nslots;
+  pfsc_slot_t *slots;
+  pthread_t *threads;
+  pfsc_worker_arg_t warg;
+  pthread_mutex_t mu;
+  pthread_cond_t work_cv;
+  pthread_cond_t done_cv;
+  bool sync_init;
+  bool stop;
+  bool worker_failed;
+  uint32_t submitted;   /* blocks handed to the queue */
+  uint32_t next_claim;  /* next block a worker will take */
+  uint32_t next_emit;   /* next block to be written to disk */
 } pfsc_sink_t;
 
+static int pfsc_thread_count(void) {
+  const char *e = getenv("WUP_THREADS");
+  long n = 0;
+  if (e && *e) {
+    char *end = NULL;
+    n = strtol(e, &end, 10);
+    if (end == e || n < 1) n = 0;
+  }
+  if (n == 0) {
+    long cpu = sysconf(_SC_NPROCESSORS_ONLN);
+    n = cpu - 1;
+    if (n > 8) n = 8;
+    if (n < 1) n = 1;
+  }
+  if (n > 64) n = 64;
+  return (int)n;
+}
+
+static void *pfsc_worker_main(void *arg) {
+  pfsc_sink_t *s = ((pfsc_worker_arg_t *)arg)->s;
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+  if (deflateInit(&strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
+    pthread_mutex_lock(&s->mu);
+    s->worker_failed = true;
+    pthread_cond_broadcast(&s->done_cv);
+    pthread_mutex_unlock(&s->mu);
+    return NULL;
+  }
+  pthread_mutex_lock(&s->mu);
+  for (;;) {
+    while (!s->stop && s->next_claim >= s->submitted) pthread_cond_wait(&s->work_cv, &s->mu);
+    if (s->stop) break;
+    pfsc_slot_t *sl = &s->slots[s->next_claim % s->nslots];
+    s->next_claim++;
+    pthread_mutex_unlock(&s->mu);
+    int stored;
+    size_t sz = pfsc_compress_block(&strm, sl->in, sl->out, &stored);
+    pthread_mutex_lock(&s->mu);
+    sl->sz = sz;
+    sl->stored = stored;
+    sl->state = SLOT_DONE;
+    pthread_cond_broadcast(&s->done_cv);
+  }
+  pthread_mutex_unlock(&s->mu);
+  deflateEnd(&strm);
+  return NULL;
+}
+
+/* Stops and joins all workers (safe to call repeatedly), then releases everything. */
 static void pfsc_sink_free(pfsc_sink_t *s) {
+  if (s->sync_init) {
+    pthread_mutex_lock(&s->mu);
+    s->stop = true;
+    pthread_cond_broadcast(&s->work_cv);
+    pthread_mutex_unlock(&s->mu);
+    for (int i = 0; i < s->nstarted; i++) pthread_join(s->threads[i], NULL);
+    s->nstarted = 0;
+    pthread_cond_destroy(&s->work_cv);
+    pthread_cond_destroy(&s->done_cv);
+    pthread_mutex_destroy(&s->mu);
+    s->sync_init = false;
+  }
+  if (s->slots) {
+    for (uint32_t i = 0; i < s->nslots; i++) { free(s->slots[i].in); free(s->slots[i].out); }
+  }
+  free(s->slots); free(s->threads);
+  s->slots = NULL; s->threads = NULL;
   if (s->zinit) deflateEnd(&s->strm);
   s->zinit = false;
   free(s->in_buf); free(s->out_buf); free(s->offsets);
   s->in_buf = s->out_buf = NULL;
   s->offsets = NULL;
+}
+
+/* Allocate the slot ring and start the workers. Returns 0 on success; on failure the caller
+ * releases everything and falls back to the serial path. */
+static int pfsc_mt_start(pfsc_sink_t *s, int nthreads) {
+  s->nslots = (uint32_t)nthreads * 8;
+  if (s->nslots > 256) s->nslots = 256;
+  if (s->nslots < 8) s->nslots = 8;
+  s->slots = (pfsc_slot_t *)calloc(s->nslots, sizeof(pfsc_slot_t));
+  s->threads = (pthread_t *)calloc((size_t)nthreads, sizeof(pthread_t));
+  if (!s->slots || !s->threads) return -1;
+  for (uint32_t i = 0; i < s->nslots; i++) {
+    s->slots[i].in = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE);
+    s->slots[i].out = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE * 2);
+    if (!s->slots[i].in || !s->slots[i].out) return -1;
+  }
+  if (pthread_mutex_init(&s->mu, NULL) != 0) return -1;
+  if (pthread_cond_init(&s->work_cv, NULL) != 0) { pthread_mutex_destroy(&s->mu); return -1; }
+  if (pthread_cond_init(&s->done_cv, NULL) != 0) {
+    pthread_cond_destroy(&s->work_cv); pthread_mutex_destroy(&s->mu); return -1;
+  }
+  s->sync_init = true;
+  s->warg.s = s;
+  for (int i = 0; i < nthreads; i++) {
+    if (pthread_create(&s->threads[s->nstarted], NULL, pfsc_worker_main, &s->warg) != 0) break;
+    s->nstarted++;
+  }
+  if (s->nstarted == 0) return -1;
+  s->nthreads = nthreads;
+  return 0;
 }
 
 /* Called once with the exact image size: reserves header area and allocates state. */
@@ -270,19 +419,36 @@ static int pfsc_sink_begin(uint64_t total_bytes, void *ctx) {
   s->initial_data_offset = pfsc_data_offset(s->block_count);
   s->cur_off = s->initial_data_offset;
 
+  int nthreads = pfsc_thread_count();
+  if ((uint64_t)nthreads > s->block_count) nthreads = (int)s->block_count;
+  if (nthreads > 1 && pfsc_mt_start(s, nthreads) != 0) {
+    /* Could not set up threading: tear it down and use the legacy serial path. */
+    pfsc_sink_free(s);
+    s->stop = false;
+    s->nthreads = 1;
+  }
+
   s->offsets = (uint64_t *)calloc((size_t)s->block_count + 1, sizeof(uint64_t));
-  s->in_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE);
-  s->out_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE * 2);
-  if (!s->offsets || !s->in_buf || !s->out_buf) {
+  if (!s->offsets) {
     snprintf(s->err, sizeof(s->err), "Out of memory for PFSC buffers (%u blocks)", s->block_count);
     return -1;
   }
-  memset(&s->strm, 0, sizeof(s->strm));
-  if (deflateInit(&s->strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
-    snprintf(s->err, sizeof(s->err), "deflateInit failed");
-    return -1;
+
+  if (s->nthreads <= 1) {
+    s->nthreads = 1;
+    s->in_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE);
+    s->out_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE * 2);
+    if (!s->in_buf || !s->out_buf) {
+      snprintf(s->err, sizeof(s->err), "Out of memory for PFSC buffers (%u blocks)", s->block_count);
+      return -1;
+    }
+    memset(&s->strm, 0, sizeof(s->strm));
+    if (deflateInit(&s->strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
+      snprintf(s->err, sizeof(s->err), "deflateInit failed");
+      return -1;
+    }
+    s->zinit = true;
   }
-  s->zinit = true;
 
   uint8_t zero_buf[4096] = {0};
   uint64_t pad = s->initial_data_offset;
@@ -297,10 +463,76 @@ static int pfsc_sink_begin(uint64_t total_bytes, void *ctx) {
   return 0;
 }
 
+/* MT: write the next in-order block if its slot is DONE. Caller holds s->mu (dropped around the
+ * write; only this thread touches a DONE slot). Returns 1 emitted, 0 not ready, -1 error. */
+static int pfsc_mt_try_emit(pfsc_sink_t *s) {
+  pfsc_slot_t *sl = &s->slots[s->next_emit % s->nslots];
+  if (sl->state != SLOT_DONE) return 0;
+  pthread_mutex_unlock(&s->mu);
+  s->offsets[s->next_emit] = s->cur_off;
+  int rc = pfsc_write_block(sl->in, sl->out, sl->sz, sl->stored, s->f, &s->cur_off, s->err, sizeof(s->err));
+  pthread_mutex_lock(&s->mu);
+  if (rc != 0) return -1;
+  sl->state = SLOT_FREE;
+  s->next_emit++;
+  return 1;
+}
+
+/* MT: wait until the slot for the next block is free, emitting finished blocks meanwhile. */
+static int pfsc_mt_acquire(pfsc_sink_t *s) {
+  int rc = 0;
+  pthread_mutex_lock(&s->mu);
+  for (;;) {
+    if (s->worker_failed) {
+      snprintf(s->err, sizeof(s->err), "deflateInit failed in worker thread");
+      rc = -1; break;
+    }
+    int e = pfsc_mt_try_emit(s);
+    if (e < 0) { rc = -1; break; }
+    if (e > 0) continue;
+    if (s->slots[s->next_block % s->nslots].state == SLOT_FREE) break;
+    pthread_cond_wait(&s->done_cv, &s->mu);
+  }
+  pthread_mutex_unlock(&s->mu);
+  return rc;
+}
+
+/* MT: hand the filled block to the workers. */
+static void pfsc_mt_submit(pfsc_sink_t *s) {
+  pthread_mutex_lock(&s->mu);
+  s->slots[s->next_block % s->nslots].state = SLOT_QUEUED;
+  s->submitted++;
+  pthread_cond_signal(&s->work_cv);
+  pthread_mutex_unlock(&s->mu);
+}
+
+/* MT: write every outstanding block, in order. */
+static int pfsc_mt_drain(pfsc_sink_t *s) {
+  int rc = 0;
+  pthread_mutex_lock(&s->mu);
+  while (s->next_emit < s->submitted) {
+    if (s->worker_failed) {
+      snprintf(s->err, sizeof(s->err), "deflateInit failed in worker thread");
+      rc = -1; break;
+    }
+    int e = pfsc_mt_try_emit(s);
+    if (e < 0) { rc = -1; break; }
+    if (e == 0) pthread_cond_wait(&s->done_cv, &s->mu);
+  }
+  pthread_mutex_unlock(&s->mu);
+  return rc;
+}
+
+static uint8_t *pfsc_cur_in(pfsc_sink_t *s) {
+  return s->nthreads > 1 ? s->slots[s->next_block % s->nslots].in : s->in_buf;
+}
+
 static int pfsc_sink_flush_block(pfsc_sink_t *s) {
-  if (s->next_block >= s->block_count) {
-    snprintf(s->err, sizeof(s->err), "Image larger than declared size");
-    return -1;
+  if (s->nthreads > 1) {
+    pfsc_mt_submit(s);
+    s->next_block++;
+    s->fill = 0;
+    return 0;
   }
   s->offsets[s->next_block] = s->cur_off;
   if (pfsc_emit_block(&s->strm, s->in_buf, s->out_buf, s->f, &s->cur_off, s->err, sizeof(s->err)) != 0) {
@@ -315,9 +547,16 @@ static int pfsc_sink_write(const void *buf, size_t len, void *ctx) {
   pfsc_sink_t *s = (pfsc_sink_t *)ctx;
   const uint8_t *p = (const uint8_t *)buf;
   while (len > 0) {
+    if (s->fill == 0) {
+      if (s->next_block >= s->block_count) {
+        snprintf(s->err, sizeof(s->err), "Image larger than declared size");
+        return -1;
+      }
+      if (s->nthreads > 1 && pfsc_mt_acquire(s) != 0) return -1;
+    }
     size_t room = PFSC_LOGICAL_BLOCK_SIZE - s->fill;
     size_t n = (len < room) ? len : room;
-    memcpy(s->in_buf + s->fill, p, n);
+    memcpy(pfsc_cur_in(s) + s->fill, p, n);
     s->fill += n; p += n; len -= n;
     if (s->fill == PFSC_LOGICAL_BLOCK_SIZE && pfsc_sink_flush_block(s) != 0) return -1;
   }
@@ -327,9 +566,10 @@ static int pfsc_sink_write(const void *buf, size_t len, void *ctx) {
 /* Zero-pad and flush the last partial block, then backpatch header + offset table. */
 static int pfsc_sink_finish(pfsc_sink_t *s) {
   if (s->fill > 0) {
-    memset(s->in_buf + s->fill, 0, PFSC_LOGICAL_BLOCK_SIZE - s->fill);
+    memset(pfsc_cur_in(s) + s->fill, 0, PFSC_LOGICAL_BLOCK_SIZE - s->fill);
     if (pfsc_sink_flush_block(s) != 0) return -1;
   }
+  if (s->nthreads > 1 && pfsc_mt_drain(s) != 0) return -1;
   if (s->next_block != s->block_count) {
     snprintf(s->err, sizeof(s->err), "Image shorter than declared size (%u of %u blocks)",
              s->next_block, s->block_count);

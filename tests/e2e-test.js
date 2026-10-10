@@ -111,13 +111,13 @@ function socketIsLive() {
   });
 }
 
-async function startDaemon() {
+async function startDaemon(env) {
   if (!fs.existsSync(BIN)) throw new Error('build the daemon first: make linux');
   if (await socketIsLive()) {
     throw new Error('another wfm-ultrapack-helper is already listening on ' + SOCK + '; stop it before running the e2e tests');
   }
   try { fs.unlinkSync(SOCK); } catch (_) {} // stale socket file only
-  const p = spawn(BIN, [], { stdio: 'ignore' });
+  const p = spawn(BIN, [], { stdio: 'ignore', env: env || process.env });
   return p;
 }
 
