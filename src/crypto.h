@@ -23,8 +23,8 @@ void sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 void hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen,
                  uint8_t out[32]);
 
-/* AES-128. Call crypto_init() once at startup (before starting threads) to
- * build the lookup tables; it is also called lazily and is idempotent. */
+/* AES-128. Lookup tables are initialized once, safely across threads.
+ * crypto_init() is optional; aes128_set_key() also calls it lazily. */
 typedef struct {
     uint32_t ek[44]; /* encryption round keys */
     uint32_t dk[44]; /* decryption round keys (equivalent inverse cipher) */

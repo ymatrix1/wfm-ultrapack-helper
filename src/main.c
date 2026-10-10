@@ -190,6 +190,12 @@ static void *conversion_worker_thread(void *arg) {
                            on_convert_progress, check_cancel,
                            job, err_msg, sizeof(err_msg));
 
+  /* Volatile stores prevent the compiler from removing the passcode wipe. */
+  volatile unsigned char *passcode_bytes = (volatile unsigned char *)job->passcode;
+  for (size_t i = 0; i < sizeof(job->passcode); i++) {
+    passcode_bytes[i] = 0;
+  }
+
   if (ret == 0) {
     send_frame_locked(job->ctx, WUP_MSG_DONE, job->request_id, NULL, 0);
   } else {

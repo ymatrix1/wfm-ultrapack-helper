@@ -1,5 +1,6 @@
 #include "crypto.h"
 
+#include <pthread.h>
 #include <string.h>
 
 /* ---------------- SHA-256 ---------------- */
@@ -107,7 +108,7 @@ void hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mle
 
 static uint8_t SBOX[256], ISBOX[256];
 static uint32_t TE0[256], TD0[256];
-static volatile int tables_ready = 0;
+static pthread_once_t tables_once = PTHREAD_ONCE_INIT;
 
 static uint8_t xt(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
 static uint8_t gmul(uint8_t a, uint8_t b) {
@@ -118,10 +119,9 @@ static uint8_t gmul(uint8_t a, uint8_t b) {
 static uint8_t rotl8(uint8_t x, int n) { return (uint8_t)((x << n) | (x >> (8 - n))); }
 static uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 
-void crypto_init(void) {
+static void init_tables(void) {
     int i;
     uint8_t p = 1, q = 1;
-    if (tables_ready) return;
     /* S-box via the standard multiplicative-inverse walk over GF(2^8) */
     do {
         p = (uint8_t)(p ^ (p << 1) ^ ((p & 0x80) ? 0x1b : 0));
@@ -138,7 +138,10 @@ void crypto_init(void) {
         TD0[i] = (uint32_t)gmul(si, 14) | ((uint32_t)gmul(si, 9) << 8) |
                  ((uint32_t)gmul(si, 13) << 16) | ((uint32_t)gmul(si, 11) << 24);
     }
-    tables_ready = 1;
+}
+
+void crypto_init(void) {
+    pthread_once(&tables_once, init_tables);
 }
 
 static uint32_t ld32(const uint8_t *p) {
