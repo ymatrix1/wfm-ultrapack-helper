@@ -69,10 +69,12 @@ class Client {
   close() { this.sock.destroy(); }
 }
 
-async function convert(src, dstDir, rid = 1) {
+async function convert(src, dstDir, rid = 1) { return convertFmt(src, dstDir, "ffpfsc", rid); }
+
+async function convertFmt(src, dstDir, fmt, rid = 1) {
   const c = new Client();
   await c.ready();
-  c.send(frame(T.CONVERT, rid, Buffer.from(`${src}\n${dstDir}\nffpfsc`)));
+  c.send(frame(T.CONVERT, rid, Buffer.from(`${src}\n${dstDir}\n${fmt}`)));
   const t = await c.terminal();
   c.close();
   return t;
@@ -187,6 +189,80 @@ async function main() {
         });
       }
     }
+
+    // ---------- image -> ffpfsc (convert_image_to_ffpfsc) ----------
+    const imgDir = path.join(work, 'imgs'); fs.mkdirSync(imgDir);
+    {
+      daemon = await startDaemon(1);
+      try {
+        const eo = path.join(work, 'exfat_out'); fs.mkdirSync(eo);
+        const r = await convertFmt(tree, eo, 'exfat', 51);
+        assert.strictEqual(r.type, T.DONE, r.payload);
+        fs.copyFileSync(path.join(eo, fs.readdirSync(eo)[0]), path.join(imgDir, 'tree.exfat'));
+      } finally { await stopDaemon(daemon); daemon = null; }
+      writeBig(path.join(imgDir, 'raw.img'), 40, 3, 'random');
+      fs.appendFileSync(path.join(imgDir, 'raw.img'), semiData(12345, 9)); // odd tail
+    }
+    for (const img of ['tree.exfat', 'raw.img']) {
+      const rh = {};
+      for (const n of [1, 2, 4, 8]) {
+        await test(`image ${img} -> ffpfsc: WUP_THREADS=${n} byte-identical to 1`, async () => {
+          daemon = await startDaemon(n);
+          try {
+            const out = path.join(work, `iout_${img}_${n}`); fs.mkdirSync(out);
+            const r = await convert(path.join(imgDir, img), out, 52);
+            assert.strictEqual(r.type, T.DONE, r.payload);
+            const h = sha256(path.join(out, fs.readdirSync(out)[0]));
+            if (n === 1) rh[img] = h; else assert.strictEqual(h, rh[img]);
+          } finally { await stopDaemon(daemon); daemon = null; }
+        });
+      }
+    }
+    await test('image -> ffpfsc: WUP_THREADS=8 cancel removes the output and the daemon keeps working', async () => {
+      daemon = await startDaemon(8);
+      try {
+        const big = path.join(work, 'cancel.img'); writeBig(big, 300, 0, 'random');
+        const cout = path.join(work, 'icancel_out'); fs.mkdirSync(cout);
+        const c = new Client(); await c.ready();
+        c.send(frame(T.CONVERT, 53, Buffer.from(`${big}
+${cout}
+ffpfsc`)));
+        await c.until(f => f.type === T.PROGRESS && f.rid === 53n);
+        c.send(frame(T.CANCEL, 53));
+        const end = await c.until(f => (f.type === T.ERROR || f.type === T.DONE) && f.rid === 53n);
+        assert.strictEqual(end.type, T.ERROR, 'finished before the cancel landed');
+        assert.match(end.payload, /cancel/i);
+        assert.deepStrictEqual(fs.readdirSync(cout), []);
+        c.close();
+        await ping();
+        fs.unlinkSync(big);
+      } finally { await stopDaemon(daemon); daemon = null; }
+    });
+    await test('image -> ffpfsc speed: 8 threads vs 1 thread', async () => {
+      const mb = parseInt(process.env.MT_SPEED_MB || '600', 10);
+      const big = path.join(imgDir, 'speed.img');
+      writeBig(big, mb, 5000, 'semi');
+      const rate = {}; let h1 = null;
+      for (const n of [1, 8]) {
+        daemon = await startDaemon(n);
+        try {
+          const out = path.join(work, `ispeed_${n}`); fs.mkdirSync(out);
+          const t0 = process.hrtime.bigint();
+          const r = await convert(big, out, 54);
+          const sec = Number(process.hrtime.bigint() - t0) / 1e9;
+          assert.strictEqual(r.type, T.DONE, r.payload);
+          rate[n] = mb / sec;
+          console.log(`       image threads=${n}: ${sec.toFixed(2)} s, ${rate[n].toFixed(1)} MB/s`);
+          const h = sha256(path.join(out, fs.readdirSync(out)[0]));
+          if (n === 1) h1 = h; else assert.strictEqual(h, h1);
+          fs.rmSync(out, { recursive: true, force: true });
+        } finally { await stopDaemon(daemon); daemon = null; }
+      }
+      const ratio = rate[8] / rate[1];
+      console.log(`       image speedup 8 vs 1: ${ratio.toFixed(2)}x (${os.cpus().length} CPUs)`);
+      if (os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x, got ${ratio.toFixed(2)}x`);
+      fs.unlinkSync(big);
+    });
 
     // ---------- cancel with 8 threads ----------
     await test('WUP_THREADS=8: cancel mid-stream leaves no output, no leaked threads, daemon still works', async () => {
