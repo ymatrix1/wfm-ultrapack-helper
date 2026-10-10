@@ -267,6 +267,7 @@ handle_client(void *arg) {
     } else if (frame.type == WUP_MSG_CONVERT) {
       if (FLAG_LOAD(&ctx->is_busy)) {
         const char *err = "Conversion already in progress";
+        scrub_bytes(payload, frame.payload_size);
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -342,6 +343,7 @@ handle_client(void *arg) {
       if (pthread_create(&worker_tid, &attr, conversion_worker_thread, job) != 0) {
         pthread_attr_destroy(&attr);
         FLAG_STORE(&ctx->is_busy, false);
+        scrub_bytes(job->passcode, sizeof(job->passcode));
         free(job);
         const char *err = "Failed to spawn conversion thread";
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
