@@ -777,7 +777,7 @@ static int process_runs(int mode, uint8_t *dst, int dstStart, int dstSize, int o
         recent[3] = offv;
         lastOffset = offv;
         offsPos += ((offsIndex + 1) & 4) >> 2;
-        if (dstPos + offv < dstBase) return 0;
+        if (offv >= 0 || dstPos + offv < dstBase) return 0;
         int copyFrom = dstPos + offv;
         uint32_t actual;
         if (matchlen != 15) actual = matchlen + 2;
