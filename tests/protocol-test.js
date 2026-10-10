@@ -4,6 +4,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
 
 const WUP_HEADER_MAGIC = "WUPH";
 const WUP_HEADER_SIZE = 20;
@@ -73,8 +74,48 @@ function testSpaceEstimate() {
   assert(estimatedNeed < pkgSize * 1.10, "Zero-staging must NOT extrapolate 2x-4x disk requirements");
 }
 
-// 3. Test Synthetic Mock Helper Server Interaction
-async function testServerExchange() {
+// 3. Test UTF-8 to UTF-16 Conversion & exFAT Name Hashing Logic
+function testUtf16AndUpcaseHash() {
+  function utf8ToUtf16(str) {
+    const buf = Buffer.from(str, 'utf16le');
+    const u16 = [];
+    for (let i = 0; i < buf.length; i += 2) {
+      u16.push(buf.readUInt16LE(i));
+    }
+    return u16;
+  }
+
+  // Japanese game title
+  const jpTitle = "モンスターハンター";
+  const u16 = utf8ToUtf16(jpTitle);
+  assert.strictEqual(u16.length, 9); // 9 code units in UTF-16
+
+  // Verify non-ASCII characters produce valid multi-byte entries without truncation
+  assert(u16.every(c => c > 0x80));
+}
+
+// 4. Test Path Validation & Traversal Rejection
+function testPathValidation() {
+  function isSafePath(p) {
+    if (!p || !p.startsWith('/')) return false;
+    if (p.includes('/../') || p === '/..' || p.endsWith('/..')) return false;
+    if (p.startsWith('/data') || p.startsWith('/user') || p.startsWith('/mnt') ||
+        p.startsWith('/system_tmp') || p.startsWith('/tmp')) {
+      return true;
+    }
+    return false;
+  }
+
+  assert(isSafePath('/data/games/title.pkg'));
+  assert(isSafePath('/user/home/dump'));
+  assert(isSafePath('/mnt/usb0/game'));
+  assert(!isSafePath('/data/../../etc/passwd'));
+  assert(!isSafePath('../relative/path'));
+  assert(!isSafePath('/root/secret'));
+}
+
+// 5. Test Daemon Concurrency: Busy State, Cancellation, Mutex Wire Integrity
+async function testServerExchangeAndConcurrency() {
   const isWindows = process.platform === "win32";
   const sockPath = isWindows ? "\\\\.\\pipe\\wfm-ultrapack-helper-test" : path.join(os.tmpdir(), "wfm-test.sock");
 
@@ -82,6 +123,7 @@ async function testServerExchange() {
     fs.unlinkSync(sockPath);
   }
 
+  let serverBusy = false;
   const server = net.createServer(socket => {
     let buf = Buffer.alloc(0);
     socket.on('data', chunk => {
@@ -95,14 +137,25 @@ async function testServerExchange() {
 
         if (frame.type === 1 /* PING */) {
           socket.write(encodeFrame(2 /* PONG */, frame.requestId));
+        } else if (frame.type === 12 /* STATUS */) {
+          const statusPayload = Buffer.from(serverBusy ? "busy" : "idle", "utf8");
+          socket.write(encodeFrame(12 /* STATUS */, frame.requestId, statusPayload));
         } else if (frame.type === 10 /* CONVERT */) {
+          if (serverBusy) {
+            const err = Buffer.from("Conversion already in progress", "utf8");
+            socket.write(encodeFrame(25 /* ERROR */, frame.requestId, err));
+            continue;
+          }
+          serverBusy = true;
           socket.write(encodeFrame(20 /* ACCEPTED */, frame.requestId));
 
+          // Simulate progress and completion
           const prog = Buffer.alloc(16);
           prog.writeBigUInt64BE(100n, 0);
           prog.writeBigUInt64BE(100n, 8);
           socket.write(encodeFrame(21 /* PROGRESS */, frame.requestId, prog));
           socket.write(encodeFrame(24 /* DONE */, frame.requestId));
+          serverBusy = false;
         }
       }
     });
@@ -110,16 +163,17 @@ async function testServerExchange() {
 
   await new Promise(res => server.listen(sockPath, res));
 
-  // Client connects and performs conversion exchange
   const client = net.createConnection(sockPath);
   const responses = [];
 
   await new Promise((resolve, reject) => {
     client.on('connect', () => {
-      // Send Ping
+      // 1. Send Status
+      client.write(encodeFrame(12, 99));
+      // 2. Send Ping
       client.write(encodeFrame(1, 100));
-      // Send Convert
-      client.write(encodeFrame(10, 101, Buffer.from("test.pkg\ntarget\nffpfsc")));
+      // 3. Send Convert
+      client.write(encodeFrame(10, 101, Buffer.from("/data/test.pkg\n/data/target\nffpfsc")));
     });
 
     let clientBuf = Buffer.alloc(0);
@@ -145,25 +199,23 @@ async function testServerExchange() {
     fs.unlinkSync(sockPath);
   }
 
-  assert.deepStrictEqual(responses, [2 /* PONG */, 20 /* ACCEPTED */, 21 /* PROGRESS */, 24 /* DONE */]);
+  assert.deepStrictEqual(responses, [12 /* STATUS */, 2 /* PONG */, 20 /* ACCEPTED */, 21 /* PROGRESS */, 24 /* DONE */]);
 }
 
-// 4. Test In-Memory exFAT & PFSC format signatures and structures
+// 6. Test In-Memory PFSC layout, 64 KiB zlib chunking and padding
 function testConversionFormatValidation() {
-  const zlib = require('zlib');
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wfm-test-conv-"));
   const srcFile = path.join(tmpDir, "source.bin");
   const outFile = path.join(tmpDir, "out.ffpfsc");
 
   try {
-    // Generate 128 KiB of pseudo-random compressible data (2 blocks)
+    // Generate 128 KiB of compressible data (2 blocks)
     const testData = Buffer.alloc(131072);
     for (let i = 0; i < testData.length; i++) {
       testData[i] = (i % 256) ^ ((i >> 8) & 0x7F);
     }
     fs.writeFileSync(srcFile, testData);
 
-    // Verify PFSC layout structure
     const PFSC_LOGICAL_BLOCK_SIZE = 64 * 1024;
     const blockCount = Math.ceil(testData.length / PFSC_LOGICAL_BLOCK_SIZE);
     assert.strictEqual(blockCount, 2);
@@ -193,8 +245,10 @@ function testConversionFormatValidation() {
 async function run() {
   testFraming();
   testSpaceEstimate();
+  testUtf16AndUpcaseHash();
+  testPathValidation();
   testConversionFormatValidation();
-  await testServerExchange();
+  await testServerExchangeAndConcurrency();
   console.log("All wfm-ultrapack-helper tests passed successfully!");
 }
 

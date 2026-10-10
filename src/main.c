@@ -6,19 +6,33 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
-#include <poll.h>
+#include <sys/time.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "protocol.h"
 #include "convert_engine.h"
 
-static int g_running = 1;
+static volatile int g_running = 1;
+
+static void handle_signal(int sig) {
+  (void)sig;
+  g_running = 0;
+}
 
 typedef struct client_context {
   int fd;
-  uint64_t request_id;
+  pthread_mutex_t send_lock;
   volatile bool cancel_requested;
+  volatile bool is_busy;
+  uint64_t last_progress_time_ms;
 } client_context_t;
+
+static uint64_t get_time_ms(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+}
 
 static void
 put16(unsigned char *p, uint16_t v) {
@@ -56,8 +70,12 @@ get64(const unsigned char *p) {
   return ((uint64_t)get32(p) << 32) | get32(p + 4);
 }
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 static int
-send_frame(int fd, uint16_t type, uint64_t request_id, const void *payload, uint32_t size) {
+send_frame_locked(client_context_t *ctx, uint16_t type, uint64_t request_id, const void *payload, uint32_t size) {
   unsigned char header[WUP_HEADER_SIZE];
   memcpy(header, WUP_HEADER_MAGIC, 4);
   put16(header + 4, type);
@@ -65,15 +83,23 @@ send_frame(int fd, uint16_t type, uint64_t request_id, const void *payload, uint
   put32(header + 8, size);
   put64(header + 12, request_id);
 
-  if (send(fd, header, sizeof(header), 0) != sizeof(header)) return -1;
-  if (size && payload) {
-    if (send(fd, payload, size, 0) != (ssize_t)size) return -1;
+  pthread_mutex_lock(&ctx->send_lock);
+  if (send(ctx->fd, header, sizeof(header), MSG_NOSIGNAL) != sizeof(header)) {
+    pthread_mutex_unlock(&ctx->send_lock);
+    return -1;
   }
+  if (size && payload) {
+    if (send(ctx->fd, payload, size, MSG_NOSIGNAL) != (ssize_t)size) {
+      pthread_mutex_unlock(&ctx->send_lock);
+      return -1;
+    }
+  }
+  pthread_mutex_unlock(&ctx->send_lock);
   return 0;
 }
 
 static int
-recv_frame(int fd, wup_frame_t *frame, char *payload, size_t cap) {
+recv_frame(int fd, wup_frame_t *frame, char **payload_out, size_t *payload_cap) {
   unsigned char header[WUP_HEADER_SIZE];
   ssize_t n = recv(fd, header, sizeof(header), MSG_WAITALL);
   if (n <= 0) return (int)n;
@@ -86,38 +112,73 @@ recv_frame(int fd, wup_frame_t *frame, char *payload, size_t cap) {
   frame->payload_size = get32(header + 8);
   frame->request_id = get64(header + 12);
 
-  if (frame->payload_size >= cap) {
+  if (frame->payload_size > WUP_MAX_PAYLOAD) {
     errno = EMSGSIZE;
     return -1;
   }
+
+  if (frame->payload_size + 1 > *payload_cap) {
+    size_t new_cap = frame->payload_size + 4096;
+    char *new_buf = (char *)realloc(*payload_out, new_cap);
+    if (!new_buf) {
+      errno = ENOMEM;
+      return -1;
+    }
+    *payload_out = new_buf;
+    *payload_cap = new_cap;
+  }
+
   if (frame->payload_size) {
-    n = recv(fd, payload, frame->payload_size, MSG_WAITALL);
+    n = recv(fd, *payload_out, frame->payload_size, MSG_WAITALL);
     if (n != (ssize_t)frame->payload_size) return -1;
   }
-  payload[frame->payload_size] = '\0';
+  (*payload_out)[frame->payload_size] = '\0';
   return 1;
-}
-
-static void on_convert_progress(uint64_t total, uint64_t done, void *user_data) {
-  client_context_t *ctx = (client_context_t *)user_data;
-  unsigned char prog[16];
-  put64(prog, total);
-  put64(prog + 8, done);
-  send_frame(ctx->fd, WUP_MSG_PROGRESS, ctx->request_id, prog, sizeof(prog));
-}
-
-static bool check_cancel(void *user_data) {
-  client_context_t *ctx = (client_context_t *)user_data;
-  return ctx->cancel_requested;
 }
 
 typedef struct worker_job {
   client_context_t *ctx;
-  char source[2048];
-  char destination[2048];
+  char source[4096];
+  char destination[4096];
   char format[64];
   uint64_t request_id;
 } worker_job_t;
+
+static void on_convert_progress(uint64_t total, uint64_t done, void *user_data) {
+  worker_job_t *job = (worker_job_t *)user_data;
+  uint64_t now = get_time_ms();
+  /* Throttle progress updates to at most ~4/sec (every 250ms), except at start/completion */
+  if (done > 0 && done < total && (now - job->ctx->last_progress_time_ms < 250)) {
+    return;
+  }
+  job->ctx->last_progress_time_ms = now;
+
+  unsigned char prog[16];
+  put64(prog, total);
+  put64(prog + 8, done);
+  send_frame_locked(job->ctx, WUP_MSG_PROGRESS, job->request_id, prog, sizeof(prog));
+}
+
+static bool check_cancel(void *user_data) {
+  worker_job_t *job = (worker_job_t *)user_data;
+  return job->ctx->cancel_requested;
+}
+
+static bool is_safe_path(const char *path) {
+  if (!path || !path[0]) return false;
+  if (path[0] != '/') return false;
+  /* Prevent directory traversal */
+  if (strstr(path, "/../") || !strcmp(path, "/..") || strstr(path, "/..") == path + strlen(path) - 3) {
+    return false;
+  }
+  /* On PS5 / jailed system, allow typical root locations */
+  if (!strncmp(path, "/data", 5) || !strncmp(path, "/user", 5) ||
+      !strncmp(path, "/mnt", 4) || !strncmp(path, "/system_tmp", 11) ||
+      !strncmp(path, "/tmp", 4)) {
+    return true;
+  }
+  return false;
+}
 
 static void *conversion_worker_thread(void *arg) {
   worker_job_t *job = (worker_job_t *)arg;
@@ -125,15 +186,16 @@ static void *conversion_worker_thread(void *arg) {
 
   int ret = run_conversion(job->source, job->destination, job->format,
                            on_convert_progress, check_cancel,
-                           job->ctx, err_msg, sizeof(err_msg));
+                           job, err_msg, sizeof(err_msg));
 
   if (ret == 0) {
-    send_frame(job->ctx->fd, WUP_MSG_DONE, job->request_id, NULL, 0);
+    send_frame_locked(job->ctx, WUP_MSG_DONE, job->request_id, NULL, 0);
   } else {
     const char *resp = err_msg[0] ? err_msg : "Conversion failed";
-    send_frame(job->ctx->fd, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
+    send_frame_locked(job->ctx, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
   }
 
+  job->ctx->is_busy = false;
   free(job);
   return NULL;
 }
@@ -142,68 +204,140 @@ static void *
 handle_client(void *arg) {
   int fd = (int)(intptr_t)arg;
   wup_frame_t frame;
-  char payload[8192];
-  memset(&frame, 0, sizeof(frame));
-  memset(payload, 0, sizeof(payload));
-  client_context_t ctx;
-  ctx.fd = fd;
-  ctx.request_id = 0;
-  ctx.cancel_requested = false;
+  size_t payload_cap = 65536;
+  char *payload = (char *)malloc(payload_cap);
+  if (!payload) {
+    close(fd);
+    return NULL;
+  }
+
+  client_context_t *ctx = (client_context_t *)calloc(1, sizeof(client_context_t));
+  if (!ctx) {
+    free(payload);
+    close(fd);
+    return NULL;
+  }
+  ctx->fd = fd;
+  pthread_mutex_init(&ctx->send_lock, NULL);
+  ctx->cancel_requested = false;
+  ctx->is_busy = false;
+  ctx->last_progress_time_ms = 0;
   pthread_t worker_tid = 0;
 
   while (g_running) {
-    int ret = recv_frame(fd, &frame, payload, sizeof(payload));
+    int ret = recv_frame(fd, &frame, &payload, &payload_cap);
     if (ret <= 0) break;
 
-    ctx.request_id = frame.request_id;
-
     if (frame.type == WUP_MSG_PING) {
-      send_frame(fd, WUP_MSG_PONG, frame.request_id, NULL, 0);
+      send_frame_locked(ctx, WUP_MSG_PONG, frame.request_id, NULL, 0);
+    } else if (frame.type == WUP_MSG_STATUS) {
+      const char *st = ctx->is_busy ? "busy" : "idle";
+      send_frame_locked(ctx, WUP_MSG_STATUS, frame.request_id, st, (uint32_t)strlen(st));
     } else if (frame.type == WUP_MSG_CANCEL) {
-      ctx.cancel_requested = true;
+      ctx->cancel_requested = true;
     } else if (frame.type == WUP_MSG_CONVERT) {
-      /* Reset cancellation for fresh job */
-      ctx.cancel_requested = false;
-      send_frame(fd, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
+      if (ctx->is_busy) {
+        const char *err = "Conversion already in progress";
+        send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        continue;
+      }
+
+      /* Parse 3 newline-separated parameters without skipping empty fields */
+      char *first_nl = strchr(payload, '\n');
+      if (!first_nl) {
+        const char *err = "Invalid convert payload: missing destination";
+        send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        continue;
+      }
+      *first_nl = '\0';
+      char *src_path = payload;
+      char *rem = first_nl + 1;
+
+      char *second_nl = strchr(rem, '\n');
+      char *dst_path = rem;
+      char *fmt_str = "ffpfsc";
+      if (second_nl) {
+        *second_nl = '\0';
+        fmt_str = second_nl + 1;
+      }
+
+      if (!is_safe_path(src_path) || !is_safe_path(dst_path)) {
+        const char *err = "Invalid or disallowed path";
+        send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        continue;
+      }
 
       worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
       if (!job) {
         const char *err = "Out of memory";
-        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
 
-      job->ctx = &ctx;
+      job->ctx = ctx;
       job->request_id = frame.request_id;
-      strncpy(job->format, "ffpfsc", sizeof(job->format) - 1);
+      strncpy(job->source, src_path, sizeof(job->source) - 1);
+      strncpy(job->destination, dst_path, sizeof(job->destination) - 1);
+      strncpy(job->format, fmt_str, sizeof(job->format) - 1);
 
-      char *line1 = strtok(payload, "\n");
-      char *line2 = strtok(NULL, "\n");
-      char *line3 = strtok(NULL, "\n");
+      ctx->cancel_requested = false;
+      ctx->is_busy = true;
+      ctx->last_progress_time_ms = 0;
+      send_frame_locked(ctx, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
-      if (line1) strncpy(job->source, line1, sizeof(job->source) - 1);
-      if (line2) strncpy(job->destination, line2, sizeof(job->destination) - 1);
-      if (line3) strncpy(job->format, line3, sizeof(job->format) - 1);
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      /* Give worker thread 2 MiB explicit stack space to prevent stack overflows */
+      pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
 
-      if (pthread_create(&worker_tid, NULL, conversion_worker_thread, job) != 0) {
+      if (pthread_create(&worker_tid, &attr, conversion_worker_thread, job) != 0) {
+        pthread_attr_destroy(&attr);
+        ctx->is_busy = false;
         free(job);
         const char *err = "Failed to spawn conversion thread";
-        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
       } else {
-        pthread_detach(worker_tid);
+        pthread_attr_destroy(&attr);
       }
+    } else {
+      /* Unknown frame type */
+      const char *err = "Unknown message type";
+      send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
     }
   }
 
-  /* Wait for or cancel any active worker */
-  ctx.cancel_requested = true;
+  /* If client disconnected mid-task, cancel active worker and join it */
+  ctx->cancel_requested = true;
+  if (ctx->is_busy) {
+    pthread_join(worker_tid, NULL);
+  }
+
   close(fd);
+  pthread_mutex_destroy(&ctx->send_lock);
+  free(ctx);
+  free(payload);
   return NULL;
 }
 
 int main(void) {
   int server_fd;
   struct sockaddr_un addr;
+
+  /* Prevent process termination when writing to closed sockets */
+  signal(SIGPIPE, SIG_IGN);
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
+
+  /* Set up log file in /data/wfm/helper.log if directory exists */
+  mkdir("/data", 0777);
+  mkdir("/data/wfm", 0777);
+  FILE *log_fp = fopen("/data/wfm/helper.log", "a");
+  if (log_fp) {
+    dup2(fileno(log_fp), STDOUT_FILENO);
+    dup2(fileno(log_fp), STDERR_FILENO);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+  }
 
   unlink(WUP_HELPER_SOCKET);
   server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -222,7 +356,7 @@ int main(void) {
     return 1;
   }
 
-  chmod(WUP_HELPER_SOCKET, 0777);
+  chmod(WUP_HELPER_SOCKET, 0770);
 
   if (listen(server_fd, 8) < 0) {
     perror("listen");
@@ -245,5 +379,6 @@ int main(void) {
 
   close(server_fd);
   unlink(WUP_HELPER_SOCKET);
+  if (log_fp) fclose(log_fp);
   return 0;
 }

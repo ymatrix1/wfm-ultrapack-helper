@@ -1,0 +1,17 @@
+{
+  "name": "wfm-ultrapack-helper",
+  "version": "0.1.0",
+  "description": "Standalone high-performance PS5 companion helper daemon for PS5 Web File Manager",
+  "main": "tests/protocol-test.js",
+  "scripts": {
+    "test": "node tests/protocol-test.js"
+  },
+  "keywords": [
+    "ps5",
+    "exfat",
+    "ffpfsc",
+    "ultrapack"
+  ],
+  "author": "",
+  "license": "GPL-3.0"
+}

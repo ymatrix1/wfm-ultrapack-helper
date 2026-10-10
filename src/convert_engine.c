@@ -7,12 +7,35 @@
 #include <sys/stat.h>
 #include "miniz.h"
 
-/* Minimal high-performance zlib streaming to outer PFSC format (.ffpfsc)
- * PFSC file structure:
- *  - 0x00..0x30: Header
- *  - 0x400..0x10000: Block offset table (64-bit uint64 per 64 KiB block)
- *  - 0x10000..: Compressed data chunks
- */
+static void put32_le(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xFF);
+  p[1] = (uint8_t)((v >> 8) & 0xFF);
+  p[2] = (uint8_t)((v >> 16) & 0xFF);
+  p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static void put64_le(uint8_t *p, uint64_t v) {
+  put32_le(p, (uint32_t)(v & 0xFFFFFFFFU));
+  put32_le(p + 4, (uint32_t)(v >> 32));
+}
+
+typedef struct progress_envelope {
+  convert_progress_cb user_cb;
+  void *user_data;
+  double scale;
+  double offset;
+  uint64_t max_total;
+} progress_envelope_t;
+
+static void wrapped_progress(uint64_t total, uint64_t done, void *user_data) {
+  progress_envelope_t *env = (progress_envelope_t *)user_data;
+  if (!env || !env->user_cb) return;
+  uint64_t report_total = env->max_total ? env->max_total : total;
+  double ratio = total ? ((double)done / (double)total) : 0.0;
+  uint64_t report_done = (uint64_t)((env->offset + ratio * env->scale) * (double)report_total);
+  if (report_done > report_total) report_done = report_total;
+  env->user_cb(report_total, report_done, env->user_data);
+}
 
 int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_path,
                             convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
@@ -31,6 +54,12 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   }
 
   uint64_t total_input_size = (uint64_t)st.st_size;
+  if (total_input_size == 0) {
+    snprintf(err_msg, err_len, "Source image is empty (0 bytes)");
+    fclose(fin);
+    return -1;
+  }
+
   uint32_t block_count = (uint32_t)((total_input_size + PFSC_LOGICAL_BLOCK_SIZE - 1) / PFSC_LOGICAL_BLOCK_SIZE);
   uint64_t logical_size = (uint64_t)block_count * PFSC_LOGICAL_BLOCK_SIZE;
 
@@ -54,6 +83,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   while (header_pad > 0) {
     size_t p = (header_pad > sizeof(zero_buf)) ? sizeof(zero_buf) : header_pad;
     if (fwrite(zero_buf, 1, p, fout) != p) {
+      snprintf(err_msg, err_len, "Failed writing header padding: %s", strerror(errno));
       fclose(fin); fclose(fout);
       unlink(out_ffpfsc_path);
       return -1;
@@ -64,68 +94,80 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   /* Allocate table for block offsets */
   uint64_t *offsets = (uint64_t *)calloc(block_count + 1, sizeof(uint64_t));
   if (!offsets) {
-    snprintf(err_msg, err_len, "Out of memory for block table");
+    snprintf(err_msg, err_len, "Out of memory for block table (%u blocks)", block_count);
     fclose(fin); fclose(fout);
     unlink(out_ffpfsc_path);
     return -1;
   }
 
-  uint64_t current_out_offset = initial_data_offset;
-  uint8_t in_buf[PFSC_LOGICAL_BLOCK_SIZE];
-  uint8_t out_buf[PFSC_LOGICAL_BLOCK_SIZE * 2];
+  /* Allocate 64 KiB / 128 KiB compression buffers on heap */
+  uint8_t *in_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE);
+  uint8_t *out_buf = (uint8_t *)malloc(PFSC_LOGICAL_BLOCK_SIZE * 2);
+  if (!in_buf || !out_buf) {
+    snprintf(err_msg, err_len, "Out of memory for zlib buffers");
+    free(in_buf); free(out_buf); free(offsets);
+    fclose(fin); fclose(fout); unlink(out_ffpfsc_path);
+    return -1;
+  }
 
+  uint64_t current_out_offset = initial_data_offset;
   uint64_t processed_in = 0;
+
+  z_stream strm;
+  memset(&strm, 0, sizeof(strm));
+  if (deflateInit(&strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
+    snprintf(err_msg, err_len, "deflateInit failed");
+    free(in_buf); free(out_buf); free(offsets);
+    fclose(fin); fclose(fout); unlink(out_ffpfsc_path);
+    return -1;
+  }
+
+  int convert_res = 0;
 
   for (uint32_t b = 0; b < block_count; b++) {
     if (cancel_cb && cancel_cb(user_data)) {
       snprintf(err_msg, err_len, "Conversion cancelled by user");
-      free(offsets); fclose(fin); fclose(fout);
-      unlink(out_ffpfsc_path);
-      return -2;
+      convert_res = -2;
+      break;
     }
 
-    size_t nread = fread(in_buf, 1, sizeof(in_buf), fin);
-    if (nread == 0) break;
+    size_t nread = fread(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fin);
+    if (nread == 0 && ferror(fin)) {
+      snprintf(err_msg, err_len, "Error reading source image: %s", strerror(errno));
+      convert_res = -1;
+      break;
+    }
 
     /* If partial block, zero-pad remainder so logical block is always 64 KiB */
-    if (nread < sizeof(in_buf)) {
-      memset(in_buf + nread, 0, sizeof(in_buf) - nread);
+    if (nread < PFSC_LOGICAL_BLOCK_SIZE) {
+      memset(in_buf + nread, 0, PFSC_LOGICAL_BLOCK_SIZE - nread);
     }
 
     offsets[b] = current_out_offset;
 
-    /* Compress block via zlib */
-    z_stream strm;
-    memset(&strm, 0, sizeof(strm));
-    if (deflateInit(&strm, Z_DEFAULT_COMPRESSION) != Z_OK) {
-      snprintf(err_msg, err_len, "deflateInit failed");
-      free(offsets); fclose(fin); fclose(fout);
-      unlink(out_ffpfsc_path);
-      return -1;
-    }
-
-    strm.avail_in = sizeof(in_buf);
+    /* Reuse z_stream via deflateReset */
+    deflateReset(&strm);
+    strm.avail_in = PFSC_LOGICAL_BLOCK_SIZE;
     strm.next_in = in_buf;
-    strm.avail_out = sizeof(out_buf);
+    strm.avail_out = PFSC_LOGICAL_BLOCK_SIZE * 2;
     strm.next_out = out_buf;
 
     int ret = deflate(&strm, Z_FINISH);
-    size_t comp_sz = sizeof(out_buf) - strm.avail_out;
-    deflateEnd(&strm);
+    size_t comp_sz = (PFSC_LOGICAL_BLOCK_SIZE * 2) - strm.avail_out;
 
-    if (ret != Z_STREAM_END || comp_sz >= sizeof(in_buf)) {
+    if (ret != Z_STREAM_END || comp_sz >= PFSC_LOGICAL_BLOCK_SIZE) {
       /* Store uncompressed block directly as a full 64 KiB block */
-      if (fwrite(in_buf, 1, sizeof(in_buf), fout) != sizeof(in_buf)) {
-        free(offsets); fclose(fin); fclose(fout);
-        unlink(out_ffpfsc_path);
-        return -1;
+      if (fwrite(in_buf, 1, PFSC_LOGICAL_BLOCK_SIZE, fout) != PFSC_LOGICAL_BLOCK_SIZE) {
+        snprintf(err_msg, err_len, "Failed writing block to disk (disk full?): %s", strerror(errno));
+        convert_res = -1;
+        break;
       }
-      current_out_offset += sizeof(in_buf);
+      current_out_offset += PFSC_LOGICAL_BLOCK_SIZE;
     } else {
       if (fwrite(out_buf, 1, comp_sz, fout) != comp_sz) {
-        free(offsets); fclose(fin); fclose(fout);
-        unlink(out_ffpfsc_path);
-        return -1;
+        snprintf(err_msg, err_len, "Failed writing compressed block (disk full?): %s", strerror(errno));
+        convert_res = -1;
+        break;
       }
       current_out_offset += comp_sz;
     }
@@ -134,25 +176,31 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     if (progress_cb) progress_cb(total_input_size, processed_in, user_data);
   }
 
+  deflateEnd(&strm);
+  free(in_buf);
+  free(out_buf);
+
+  if (convert_res != 0) {
+    free(offsets); fclose(fin); fclose(fout);
+    unlink(out_ffpfsc_path);
+    return convert_res;
+  }
+
   offsets[block_count] = current_out_offset;
 
-  /* 2. Write Header at offset 0 */
+  /* 2. Write Header at offset 0 (little-endian explicit) */
   uint8_t hdr[PFSC_HEADER_SIZE];
   memset(hdr, 0, sizeof(hdr));
   hdr[0] = 'P'; hdr[1] = 'F'; hdr[2] = 'S'; hdr[3] = 'C'; /* 0x43534650 */
   hdr[8] = 6;
-  uint32_t blk32 = PFSC_LOGICAL_BLOCK_SIZE;
-  uint64_t blk64 = PFSC_LOGICAL_BLOCK_SIZE;
-  uint64_t boff64 = PFSC_BLOCK_OFFSETS_OFFSET;
-  uint64_t data64 = initial_data_offset;
-  memcpy(hdr + 0x0C, &blk32, 4);
-  memcpy(hdr + 0x10, &blk64, 8);
-  memcpy(hdr + 0x18, &boff64, 8);
-  memcpy(hdr + 0x20, &data64, 8);
-  memcpy(hdr + 0x28, &logical_size, 8);
+  put32_le(hdr + 0x0C, PFSC_LOGICAL_BLOCK_SIZE);
+  put64_le(hdr + 0x10, PFSC_LOGICAL_BLOCK_SIZE);
+  put64_le(hdr + 0x18, PFSC_BLOCK_OFFSETS_OFFSET);
+  put64_le(hdr + 0x20, initial_data_offset);
+  put64_le(hdr + 0x28, logical_size);
 
   if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
-    snprintf(err_msg, err_len, "Failed writing PFSC header");
+    snprintf(err_msg, err_len, "Failed writing PFSC header: %s", strerror(errno));
     free(offsets); fclose(fin); fclose(fout);
     unlink(out_ffpfsc_path);
     return -1;
@@ -160,14 +208,16 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
   /* 3. Write Offset Table starting at 0x400 */
   if (fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET) != 0) {
-    snprintf(err_msg, err_len, "Failed seeking to block offset table");
+    snprintf(err_msg, err_len, "Failed seeking to block offset table: %s", strerror(errno));
     free(offsets); fclose(fin); fclose(fout);
     unlink(out_ffpfsc_path);
     return -1;
   }
   for (uint32_t b = 0; b <= block_count; b++) {
-    if (fwrite(&offsets[b], sizeof(uint64_t), 1, fout) != 1) {
-      snprintf(err_msg, err_len, "Failed writing offset table");
+    uint8_t obuf[8];
+    put64_le(obuf, offsets[b]);
+    if (fwrite(obuf, 1, 8, fout) != 8) {
+      snprintf(err_msg, err_len, "Failed writing offset table: %s", strerror(errno));
       free(offsets); fclose(fin); fclose(fout);
       unlink(out_ffpfsc_path);
       return -1;
@@ -194,16 +244,38 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
   }
 
   bool is_exfat_target = (format_str && !strcasecmp(format_str, "exfat"));
+  bool is_ffpfsc_target = (!format_str || !strcasecmp(format_str, "ffpfsc") || !strcasecmp(format_str, "default"));
 
-  /* Path construction for output */
+  if (!is_exfat_target && !is_ffpfsc_target) {
+    snprintf(err_msg, err_len, "Unsupported target format '%s'", format_str ? format_str : "");
+    return -1;
+  }
+
+  /* Sanitize source name: strip trailing slashes */
+  char sanitized_source[4096];
+  strncpy(sanitized_source, source_path, sizeof(sanitized_source) - 1);
+  sanitized_source[sizeof(sanitized_source) - 1] = '\0';
+  size_t slen = strlen(sanitized_source);
+  while (slen > 1 && sanitized_source[slen - 1] == '/') {
+    sanitized_source[slen - 1] = '\0';
+    slen--;
+  }
+
   char target_file[4096];
-  const char *base = strrchr(source_path, '/');
-  base = base ? base + 1 : source_path;
+  const char *base = strrchr(sanitized_source, '/');
+  base = base ? base + 1 : sanitized_source;
+
   char clean_name[256];
   strncpy(clean_name, base, sizeof(clean_name) - 1);
   clean_name[sizeof(clean_name) - 1] = '\0';
-  char *ext = strrchr(clean_name, '.');
-  if (ext) *ext = '\0';
+
+  /* Only strip recognized image/pkg file extension if regular file */
+  if (!S_ISDIR(st.st_mode)) {
+    char *ext = strrchr(clean_name, '.');
+    if (ext && (!strcasecmp(ext, ".pkg") || !strcasecmp(ext, ".exfat") || !strcasecmp(ext, ".img") || !strcasecmp(ext, ".iso"))) {
+      *ext = '\0';
+    }
+  }
 
   if (is_exfat_target) {
     snprintf(target_file, sizeof(target_file), "%s/%s.exfat", dest_path, clean_name);
@@ -214,28 +286,33 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
   if (S_ISDIR(st.st_mode)) {
     if (is_exfat_target) {
       /* Direct folder -> .exfat */
-      return convert_folder_to_exfat(source_path, target_file, progress_cb, cancel_cb,
+      return convert_folder_to_exfat(sanitized_source, target_file, progress_cb, cancel_cb,
                                      user_data, err_msg, err_len);
     } else {
-      /* Folder -> .ffpfsc: generate exfat in streaming pipeline */
+      /* Folder -> .ffpfsc: 2-stage conversion with monotonic progress envelope (0..50%, 50..100%) */
       char temp_exfat[4096];
       snprintf(temp_exfat, sizeof(temp_exfat), "%s/%s.tmp.exfat", dest_path, clean_name);
-      int ret = convert_folder_to_exfat(source_path, temp_exfat, progress_cb, cancel_cb,
-                                        user_data, err_msg, err_len);
-      if (ret != 0) return ret;
 
-      ret = convert_image_to_ffpfsc(temp_exfat, target_file, progress_cb, cancel_cb,
-                                    user_data, err_msg, err_len);
+      progress_envelope_t stage1_env = { progress_cb, user_data, 0.50, 0.00, 1000000 };
+      int ret = convert_folder_to_exfat(sanitized_source, temp_exfat, wrapped_progress, cancel_cb,
+                                        &stage1_env, err_msg, err_len);
+      if (ret != 0) {
+        unlink(temp_exfat);
+        return ret;
+      }
+
+      progress_envelope_t stage2_env = { progress_cb, user_data, 0.50, 0.50, 1000000 };
+      ret = convert_image_to_ffpfsc(temp_exfat, target_file, wrapped_progress, cancel_cb,
+                                    &stage2_env, err_msg, err_len);
       unlink(temp_exfat);
       return ret;
     }
   } else {
     /* If source is an exfat/raw image file and target is ffpfsc */
     if (!is_exfat_target) {
-      return convert_image_to_ffpfsc(source_path, target_file, progress_cb, cancel_cb,
+      return convert_image_to_ffpfsc(sanitized_source, target_file, progress_cb, cancel_cb,
                                      user_data, err_msg, err_len);
     } else {
-      /* Direct copy / repack */
       snprintf(err_msg, err_len, "Source is already an image file; cannot convert to exfat");
       return -1;
     }
