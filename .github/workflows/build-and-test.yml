@@ -47,6 +47,10 @@ jobs:
         run: |
           node tests/crypto-test.js
 
+      - name: Run Listing -> exFAT/ffpfsc Tests
+        run: |
+          node tests/listing-test.js
+
   build-ps5:
     name: Build PS5 ELF
     runs-on: ubuntu-latest

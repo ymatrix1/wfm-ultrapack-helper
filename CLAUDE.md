@@ -18,6 +18,7 @@ Guidelines and architecture instructions for `wfm-ultrapack-helper`.
   - Logging directed to `/data/wfm/helper.log`.
 - `src/exfat_engine.c` & `src/exfat_engine.h`:
   - Direct zero-staging exFAT generator; emits the image in strict offset order through a sink callback (`convert_folder_to_exfat_stream`), with `convert_folder_to_exfat` as the file sink.
+  - Source-agnostic: `convert_listing_to_exfat_stream` takes a flat `exfat_listing_entry_t` list plus an `exfat_src_ops_t.read` callback (random access, strict offset order, short read = error); the folder path is just a listing builder (`scan_directory`) + pread read op on top of it. `convert_listing_to_ffpfsc` is the zero-staging .ffpfsc equivalent. Tested by `tests/listing-test.js`.
   - UTF-8 to UTF-16 conversion for filenames.
   - Up-case table lookup for checksums and name hashing.
   - `lstat` protection against symlink loops, duplicate entry detection, and heap-allocated copy buffers.
