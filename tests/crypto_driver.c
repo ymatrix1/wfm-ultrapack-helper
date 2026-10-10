@@ -5,14 +5,58 @@
  *   aesenc <key16> <block16>      aesdec <key16> <block16>
  *   xtsdec|xtsenc <k1> <k2> <sector-decimal> <sector_size> <data>
  *   bench                         (64 MiB XTS decrypt, prints "MBPS <n>")
+ *   threads                       (concurrent first-use AES vector check)
  */
 #define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "crypto.h"
+
+#define THREAD_COUNT 32
+static pthread_barrier_t start_barrier;
+
+static void *thread_aes(void *arg) {
+    static const uint8_t key[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    static const uint8_t plain[16] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    static const uint8_t cipher[16] = {
+        0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
+        0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a};
+    aes128_ctx ctx;
+    uint8_t out[16];
+    int *failed = arg;
+    pthread_barrier_wait(&start_barrier);
+    /* Mix explicit initialization and lazy initialization through key setup. */
+    if (*failed) crypto_init();
+    *failed = 0;
+    aes128_set_key(&ctx, key);
+    aes128_encrypt_block(&ctx, plain, out);
+    if (memcmp(out, cipher, sizeof out)) *failed = 1;
+    aes128_decrypt_block(&ctx, cipher, out);
+    if (memcmp(out, plain, sizeof out)) *failed = 1;
+    return NULL;
+}
+
+static void threads(void) {
+    pthread_t tids[THREAD_COUNT];
+    int failed[THREAD_COUNT], result = 0;
+    if (pthread_barrier_init(&start_barrier, NULL, THREAD_COUNT)) exit(2);
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        failed[i] = i & 1;
+        if (pthread_create(&tids[i], NULL, thread_aes, &failed[i])) exit(2);
+    }
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        if (pthread_join(tids[i], NULL)) exit(2);
+        result |= failed[i];
+    }
+    pthread_barrier_destroy(&start_barrier);
+    puts(result ? "ERR" : "OK");
+}
 
 static int hexval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -89,6 +133,8 @@ int main(void) {
             else rc = aes_xts_encrypt(a, b, strtoull(tok[3], NULL, 10), l2, c, o, l3);
             if (rc) printf("ERR\n"); else if (l3) puthex(o, l3); else printf("\n");
             free(a); free(b); free(c); free(o);
+        } else if (!strcmp(tok[0], "threads")) {
+            threads();
         } else if (!strcmp(tok[0], "bench")) {
             bench();
         } else {

@@ -9,7 +9,7 @@ const path = require('path');
 const root = path.join(__dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-crypto-'));
 const exe = path.join(tmp, 'crypto_driver' + (process.platform === 'win32' ? '.exe' : ''));
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-I', path.join(root, 'src'),
+const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', path.join(root, 'src'),
   path.join(__dirname, 'crypto_driver.c'), path.join(root, 'src', 'crypto.c'), '-o', exe],
   { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }
@@ -24,6 +24,12 @@ function check(name, got, want) {
 const h = (b) => (b.length ? Buffer.from(b).toString('hex') : '-');
 const hx = (s) => Buffer.from(s.replace(/\s+/g, ''), 'hex');
 const rnd = (n) => crypto.randomBytes(n);
+
+// Fresh processes ensure each race starts with uninitialized lookup tables.
+for (let i = 0; i < 8; i++) {
+  const r = spawnSync(exe, [], { input: 'threads\n', encoding: 'utf8', timeout: 10000 });
+  check(`concurrent AES first use #${i}`, r.status === 0 && r.stdout.trim(), 'OK');
+}
 
 // Batch every command into a single driver run.
 const jobs = [];

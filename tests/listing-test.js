@@ -14,7 +14,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-listing-'));
 process.on('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
 
 const exe = path.join(tmp, 'listing_driver');
-const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-sign-compare', '-I', path.join(root, 'src'),
+const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-sign-compare', '-pthread', '-I', path.join(root, 'src'),
   path.join(__dirname, 'listing_driver.c'), path.join(root, 'src', 'exfat_engine.c'),
   path.join(root, 'src', 'convert_engine.c'), path.join(root, 'src', 'miniz.c'),
   path.join(root, 'src', 'pkg_reader.c'), path.join(root, 'src', 'crypto.c'), path.join(root, 'src', 'rsa.c'), '-o', exe],

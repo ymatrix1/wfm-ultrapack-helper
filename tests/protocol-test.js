@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
+const { spawnSync } = require('child_process');
 
 const WUP_HEADER_MAGIC = "WUPH";
 const WUP_HEADER_SIZE = 20;
@@ -242,12 +243,28 @@ function testConversionFormatValidation() {
   }
 }
 
+function testWorkerPasscodeClearing() {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wfm-worker-'));
+  try {
+    const exe = path.join(tmpDir, 'worker_driver');
+    const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Wno-sign-compare',
+      '-pthread', path.join(__dirname, 'worker_driver.c'), '-o', exe], { encoding: 'utf8' });
+    assert.strictEqual(cc.status, 0, cc.stdout + cc.stderr);
+    const result = spawnSync(exe, [], { encoding: 'utf8', timeout: 10000 });
+    assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+    console.log(result.stdout.trim());
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function run() {
   testFraming();
   testSpaceEstimate();
   testUtf16AndUpcaseHash();
   testPathValidation();
   testConversionFormatValidation();
+  testWorkerPasscodeClearing();
   await testServerExchangeAndConcurrency();
   console.log("All wfm-ultrapack-helper tests passed successfully!");
 }
