@@ -8,10 +8,12 @@ Standalone high-performance PS5 companion helper daemon for [PS5 Web File Manage
   - Traditional tools unpack a 50–100 GB game to disk, modify files, and re-pack to another image, multiplying free space requirements (up to 3×–4× disk space).
   - `wfm-ultrapack-helper` reads the inner PPR-PFS filesystem via random-access NAPS block streaming (`InnerImage` plan).
   - Streams blocks directly from the `.pkg` into the compressed PFS `.ffpfsc` encoder in 64 KiB chunks—**requiring only the final output file's disk space**.
-- **Supported Formats:**
-  - `.pkg` (fPKG) ➔ `.ffpfsc` (compressed container for ShadowMountPlus)
-  - `.ffpfsc` / `.ffpfs` ➔ `.pkg`
-  - `.pkg` / `.ffpfsc` ➔ `/app0` folder
+- **Supported Formats & Conversions:**
+  - **Folder dump (`/app0`)** ➔ **`.exfat`** (contiguous cluster forward-only layout)
+  - **Folder dump (`/app0`)** ➔ **`.ffpfsc`** (outer PFSC zlib compressed container for ShadowMountPlus)
+  - **`.pkg` (fPKG)** ➔ **`.ffpfsc`** / **`.exfat`**
+  - **Raw / `.exfat` Image** ➔ **`.ffpfsc`** (64 KiB block compression with offset index)
+  - **`.ffpfsc` / `.ffpfs`** ➔ **`.pkg`** / `/app0` folder dump
 - **Auto-organization & naming:**
   - Automatically identifies title ID, title name, app version, and minimum firmware tag:
     `<Title> [<TitleID>] [v<Version>] [fw<FW>].ffpfsc`
@@ -21,30 +23,40 @@ Standalone high-performance PS5 companion helper daemon for [PS5 Web File Manage
 
 ---
 
-## Zero-Staging Pipeline: PKG ➔ FFPFSC
+## Zero-Staging Conversion Pipeline
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  Source .pkg (fPKG) on /user/home or /mnt/usb0         │
-└───────────────────────────┬────────────────────────────┘
-                            │
-               1. Parse CNT & Outer Superblock
-               2. Parse NAPS Layout & Inner PPR-PFS
-                            │
-┌───────────────────────────▼────────────────────────────┐
-│  Direct Block Streaming Engine (In-Memory 32 MiB span) │
-│  - Decodes Kraken / stored spans on the fly            │
-│  - Reconstructs dirents & ampr_emu.index               │
-│  - Feeds PFS zlib block compressor (level 1-9)         │
-└───────────────────────────┬────────────────────────────┘
-                            │
-               3. Assemble Outer PFS Header & Inodes
-               4. Stream directly to target storage
-                            │
-┌───────────────────────────▼────────────────────────────┐
-│  Destination .ffpfsc (ShadowMountPlus Ready)           │
-│  Disk space used: ~1x output only (no scratch copy)    │
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│  Source Input: .pkg (fPKG), Game Folder Dump (/app0), or Raw Image     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┴────────────────────────────────┐
+    │                                                                │
+ [PKG / Container Source]                                  [Folder Dump Source]
+    │                                                                │
+    ├─ 1. Parse CNT & Outer Superblock                               ├─ 1. Scan tree & sort dirents
+    ├─ 2. Parse NAPS Layout & PPR-PFS Inodes                         ├─ 2. Assign contiguous clusters
+    └─ 3. In-memory Kraken/zlib span stream                          └─ 3. Compute VBR & FAT tables
+                                    │                                │
+                                    └───────────────┬────────────────┘
+                                                    │
+┌───────────────────────────────────────────────────▼────────────────────┐
+│  Direct In-Memory Streaming Engine (32 MiB rolling buffers)            │
+│  - Zero intermediate scratch files or multi-step staging on disk       │
+│  - Direct-to-stream exFAT serializer (VBR -> FAT -> Heap)              │
+│  - Direct-to-stream PFSC block encoder (64 KiB zlib chunks + offsets)  │
+└───────────────────────────────────────────────────┬────────────────────┘
+                                                    │
+                        Stream directly to target storage
+                                                    │
+┌───────────────────────────────────────────────────▼────────────────────┐
+│  Destination Target Format:                                            │
+│  • .ffpfsc (ShadowMountPlus compressed container)                      │
+│  • .exfat  (LVD/BFS fast-path mountable image)                         │
+│  • .pkg    (fPKG installable payload)                                  │
+│                                                                        │
+│  Disk space used: ~1x output only (no 2x-4x scratch footprint)         │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
