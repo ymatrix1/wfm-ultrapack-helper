@@ -17,7 +17,7 @@ const exe = path.join(tmp, 'listing_driver');
 const cc = spawnSync('gcc', ['-std=gnu99', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-sign-compare', '-I', path.join(root, 'src'),
   path.join(__dirname, 'listing_driver.c'), path.join(root, 'src', 'exfat_engine.c'),
   path.join(root, 'src', 'convert_engine.c'), path.join(root, 'src', 'miniz.c'),
-  path.join(root, 'src', 'pkg_reader.c'), path.join(root, 'src', 'crypto.c'), path.join(root, 'src', 'rsa.c'), '-o', exe],
+  path.join(root, 'src', 'pkg_reader.c'), path.join(root, 'src', 'fih_reader.c'), path.join(root, 'src', 'kraken.c'), path.join(root, 'src', 'crypto.c'), path.join(root, 'src', 'rsa.c'), '-o', exe],
   { encoding: 'utf8' });
 if (cc.status !== 0) { console.error(cc.stdout + cc.stderr); process.exit(1); }
 

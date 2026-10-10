@@ -28,6 +28,7 @@ Guidelines and architecture instructions for `wfm-ultrapack-helper`.
   - Folder -> ffpfsc is zero-staging: exFAT stream feeds the PFSC encoder directly (no temp image), header/offset table backpatched at the end; single monotonic 0..100% progress.
   - Trailing slash sanitization.
 - `src/pkg_reader.c` & `src/pkg_reader.h`: random-access, no-extraction reader for PS4-family fake PKGs (CNT header, ENTRY_KEYS/EKPFS derivation, outer PFS XTS, PFSC, inner PFS, CNT-resident `sce_sys` files). Keys in the generated `src/pkg_keys.h` (public LibOrbisPkg keysets).
+- `src/fih_reader.c` & `src/kraken.c`: native PS5 `FIH` (7F 46 49 48) packages behind the same `pkgr_*` API (PlaintextNoAuth outer PFS, NAPS span plan, stored/zero/Kraken spans, inner PPR-PFS; GPL-3 Kraken port). `pkgr_open_io` takes a pluggable byte source (`pkgr_io_t`); `tests/http_range.c` is a GET-Range test backend, `tests/fih-test.js` skips when the console is unreachable.
 - `src/crypto.c` & `src/rsa.c`: SHA-1/SHA-256, HMAC-SHA256, AES-128 (ECB/CBC/XTS), RSA-2048 CRT private op with PKCS#1 v1.5 / OAEP unpadding. No external crypto dependency.
 - The exFAT writer takes any source through a flat listing + read callback (`convert_listing_to_exfat` / `convert_listing_to_ffpfsc`); the folder and `.pkg` paths both use it.
 - Convert request payload: `source\ndest\nformat[\npasscode]`; the optional passcode is scrubbed after parsing and never logged or echoed.

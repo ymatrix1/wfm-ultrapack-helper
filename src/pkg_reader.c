@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "crypto.h"
+#include "fih_reader.h"
 #include "miniz.h"
 
 #ifndef PKGR_NO_RSA /* define to build without the RSA IMAGE_KEY route */
@@ -507,7 +508,7 @@ static int pfsc_rd(layer_t *l, uint64_t pos, void *buf, size_t n) {
 typedef struct {
     pkgr_entry_t pub;
     char *path;
-    int kind; /* 0 dir, 1 inner PFS file, 2 CNT-resident */
+    int kind; /* 0 dir, 1 inner PFS file, 2 CNT-resident, 3 FIH inner file (logical offset in cnt_off) */
     fmap_t fm;
     uint64_t cnt_off;
 } entry_t;
@@ -515,6 +516,7 @@ typedef struct {
 struct pkgr {
     int fd;
     uint64_t file_size;
+    fih_t *fih; /* native PS5 FIH package (fd unused) */
     char errbuf[160];
     char content_id[64];
     uint64_t pfs_flags, pfs_off, pfs_size;
@@ -586,6 +588,7 @@ void pkgr_close(pkgr_t *p) {
     if (!p) return;
     free_stack(p);
     free(p->cnt_tab);
+    fih_close(p->fih);
     if (p->fd >= 0) close(p->fd);
     free(p);
 }
@@ -976,6 +979,93 @@ oom:
     return -1;
 }
 
+
+/* ---------------------------------------------------------------- FIH (native PS5) */
+typedef struct {
+    int fd;
+} file_io_t;
+
+static int file_io_pread(void *ctx, uint64_t off, void *buf, size_t n) {
+    return pread_full(((file_io_t *)ctx)->fd, buf, n, off);
+}
+
+static void file_io_close(void *ctx) {
+    file_io_t *f = ctx;
+    if (f->fd >= 0) close(f->fd);
+    free(f);
+}
+
+static int fih_list_cb(void *ctx, const char *prefix, const uint8_t *name, size_t nl, int is_dir, uint64_t size,
+                       uint64_t loff) {
+    pkgr_t *p = ctx;
+    entry_t *e = add_entry(p, prefix, name, nl, is_dir ? 0 : 3);
+    if (!e) return p->oom ? -1 : 1; /* unsafe name: skip (and do not descend) */
+    e->pub.size = size;
+    e->cnt_off = loff;
+    p->total += size;
+    return 0;
+}
+
+/* takes ownership of the io (also on failure) */
+static int open_fih(pkgr_t *p, const pkgr_io_t *io) {
+    char e[sizeof p->errbuf] = "";
+    p->file_size = io->size;
+    if (fih_open(io, &p->fih, e, sizeof e)) {
+        set_err(p, "%s", e[0] ? e : "cannot open FIH package");
+        return -1;
+    }
+    snprintf(p->content_id, sizeof p->content_id, "%s", fih_content_id(p->fih));
+    if (fih_walk(p->fih, fih_list_cb, p, e, sizeof e)) {
+        set_err(p, "%s", p->oom ? "out of memory" : (e[0] ? e : "inner PFS walk failed"));
+        return -1;
+    }
+    uint64_t off, size;
+    if (!fih_cnt_find(p->fih, 0x2000, &off, &size) && find_path(p, "sce_sys/param.json") < 0) {
+        if (find_path(p, "sce_sys") < 0 && !add_entry(p, "", (const uint8_t *)"sce_sys", 7, 0)) {
+            set_err(p, "out of memory");
+            return -1;
+        }
+        entry_t *pe = add_entry(p, "sce_sys", (const uint8_t *)"param.json", 10, 2);
+        if (!pe) {
+            set_err(p, "out of memory");
+            return -1;
+        }
+        pe->cnt_off = off;
+        pe->pub.size = size;
+        p->total += size;
+    }
+    return 0;
+}
+
+int pkgr_open_io(const pkgr_io_t *io, pkgr_t **out, char *err, size_t errlen) {
+    pkgr_t *p = calloc(1, sizeof *p);
+    *out = NULL;
+    if (!p) {
+        if (io->close) io->close(io->ctx);
+        if (err && errlen) snprintf(err, errlen, "out of memory");
+        return -1;
+    }
+    p->fd = -1;
+    if (open_fih(p, io)) {
+        if (err && errlen) snprintf(err, errlen, "%s", p->errbuf[0] ? p->errbuf : "error");
+        pkgr_close(p);
+        return -1;
+    }
+    *out = p;
+    return 0;
+}
+
+void pkgr_info(pkgr_t *p, pkgr_info_t *info) {
+    memset(info, 0, sizeof *info);
+    info->format = p->fih ? "FIH" : "7FCNT";
+    info->content_id = p->content_id;
+    if (p->fih) {
+        info->image_size = fih_image_size(p->fih);
+        info->spans = fih_span_count(p->fih);
+        fih_decode_stats(p->fih, &info->spans_stored, &info->spans_zero, &info->spans_kraken);
+    }
+}
+
 int pkgr_open(const char *path, const char *passcode, pkgr_t **out, char *err, size_t errlen) {
     pkgr_t *p = calloc(1, sizeof *p);
     uint8_t *keys = NULL, *imgkey = NULL, *names = NULL;
@@ -999,6 +1089,19 @@ int pkgr_open(const char *path, const char *passcode, pkgr_t **out, char *err, s
     }
     p->file_size = (uint64_t)st.st_size;
     uint8_t h[0x460];
+    if (!pread_full(p->fd, h, 4, 0) && !memcmp(h, "\x7f" "FIH", 4)) {
+        file_io_t *fio = malloc(sizeof *fio);
+        if (!fio) {
+            set_err(p, "out of memory");
+            goto fail;
+        }
+        fio->fd = p->fd; /* ownership moves to the io (closed by fih_close / on failure) */
+        p->fd = -1;
+        pkgr_io_t io = {file_io_pread, file_io_close, fio, p->file_size};
+        if (open_fih(p, &io)) goto fail;
+        *out = p;
+        return 0;
+    }
     if (pread_full(p->fd, h, sizeof h, 0) || memcmp(h, "\x7f" "CNT", 4)) {
         set_err(p, "not a CNT/PKG file");
         goto fail;
@@ -1116,6 +1219,8 @@ int64_t pkgr_read(pkgr_t *p, size_t idx, uint64_t offset, void *buf, size_t len)
     if (offset >= e->pub.size) return 0;
     if (len > e->pub.size - offset) len = (size_t)(e->pub.size - offset);
     if (len == 0) return 0;
+    if (e->kind == 3) return fih_read(p->fih, e->cnt_off + offset, buf, len) ? -1 : (int64_t)len;
+    if (e->kind == 2 && p->fih) return fih_raw_read(p->fih, e->cnt_off + offset, buf, len) ? -1 : (int64_t)len;
     if (e->kind == 2) return pread_full(p->fd, buf, len, e->cnt_off + offset) ? -1 : (int64_t)len;
     return fmap_read(&p->inner, &e->fm, offset, buf, len) ? -1 : (int64_t)len;
 }
