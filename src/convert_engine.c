@@ -523,14 +523,14 @@ int run_conversion_ex(const char *source_path, const char *dest_path, const char
                                       user_data, err_msg, err_len);
     }
   } else {
-    /* A .pkg (CNT magic) is read in place and streamed: no extraction, no temp image */
+    /* A .pkg (CNT or native FIH magic) is read in place and streamed: no extraction, no temp image */
     {
       FILE *probe = fopen(sanitized_source, "rb");
       if (probe) {
         unsigned char magic[4] = {0};
         size_t got = fread(magic, 1, sizeof(magic), probe);
         fclose(probe);
-        if (got == 4 && magic[0] == 0x7f && !memcmp(magic + 1, "CNT", 3)) {
+        if (got == 4 && magic[0] == 0x7f && (!memcmp(magic + 1, "CNT", 3) || !memcmp(magic + 1, "FIH", 3))) {
           return convert_pkg(sanitized_source, target_file, is_exfat_target, passcode,
                              progress_cb, cancel_cb, user_data, err_msg, err_len);
         }
