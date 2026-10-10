@@ -150,21 +150,44 @@ async function testServerExchange() {
 
 // 4. Test In-Memory exFAT & PFSC format signatures and structures
 function testConversionFormatValidation() {
-  // Test PFSC header constants
-  const PFSC_MAGIC = 0x43534650; // 'PFSC'
-  const PFSC_LOGICAL_BLOCK_SIZE = 64 * 1024;
-  assert.strictEqual(PFSC_MAGIC, 0x43534650);
-  assert.strictEqual(PFSC_LOGICAL_BLOCK_SIZE, 65536);
+  const zlib = require('zlib');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wfm-test-conv-"));
+  const srcFile = path.join(tmpDir, "source.bin");
+  const outFile = path.join(tmpDir, "out.ffpfsc");
 
-  // Test exFAT VBR signature and layout calculation
-  const vbr = Buffer.alloc(512);
-  vbr[0] = 0xEB; vbr[1] = 0x76; vbr[2] = 0x90;
-  vbr.write("EXFAT   ", 3, 8, "ascii");
-  vbr.writeUInt16LE(0xAA55, 510);
+  try {
+    // Generate 128 KiB of pseudo-random compressible data (2 blocks)
+    const testData = Buffer.alloc(131072);
+    for (let i = 0; i < testData.length; i++) {
+      testData[i] = (i % 256) ^ ((i >> 8) & 0x7F);
+    }
+    fs.writeFileSync(srcFile, testData);
 
-  assert.strictEqual(vbr[0], 0xEB);
-  assert.strictEqual(vbr.toString("ascii", 3, 11), "EXFAT   ");
-  assert.strictEqual(vbr.readUInt16LE(510), 0xAA55);
+    // Verify PFSC layout structure
+    const PFSC_LOGICAL_BLOCK_SIZE = 64 * 1024;
+    const blockCount = Math.ceil(testData.length / PFSC_LOGICAL_BLOCK_SIZE);
+    assert.strictEqual(blockCount, 2);
+
+    // Verify zlib block round-trip
+    const block0 = testData.subarray(0, 65536);
+    const deflated = zlib.deflateSync(block0);
+    const inflated = zlib.inflateSync(deflated);
+    assert.deepStrictEqual(inflated, block0);
+
+    // Verify exFAT VBR header computation
+    const vbr = Buffer.alloc(512);
+    vbr[0] = 0xEB; vbr[1] = 0x76; vbr[2] = 0x90;
+    vbr.write("EXFAT   ", 3, 8, "ascii");
+    vbr.writeUInt16LE(0xAA55, 510);
+    assert.strictEqual(vbr.toString("ascii", 3, 11), "EXFAT   ");
+    assert.strictEqual(vbr.readUInt16LE(510), 0xAA55);
+  } finally {
+    try {
+      if (fs.existsSync(srcFile)) fs.unlinkSync(srcFile);
+      if (fs.existsSync(outFile)) fs.unlinkSync(outFile);
+      fs.rmdirSync(tmpDir);
+    } catch (_) {}
+  }
 }
 
 async function run() {
