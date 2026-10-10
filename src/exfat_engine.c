@@ -329,20 +329,15 @@ static int write_directory_cluster(FILE *fout, const exfat_file_node_t *dir, boo
 
   size_t offset = 0;
   if (is_root) {
-    /* Volume label */
+    /* Volume label: empty, as in the reference mkpfs writer */
     buf[offset] = 0x83;
-    buf[offset + 1] = 4;
-    const char *lbl = "GAME";
-    for (int i = 0; i < 4; i++) {
-      put16_le(buf + offset + 2 + i * 2, (uint8_t)lbl[i]);
-    }
     offset += 32;
 
     /* Allocation Bitmap Directory Entry */
     buf[offset] = 0x81;
     buf[offset + 1] = 0;
     put32_le(buf + offset + 20, bitmap_first_cluster);
-    put64_le(buf + offset + 24, (uint64_t)cluster_count / 8 + 1);
+    put64_le(buf + offset + 24, (uint64_t)ceil_div32(cluster_count, 8));
     offset += 32;
 
     /* Up-case Table Directory Entry */

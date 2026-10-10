@@ -277,6 +277,15 @@ async function main() {
       const fatOff = b.readUInt32LE(80) * 512, root = b.readUInt32LE(96);
       const fat = fs.readFileSync(img).subarray(fatOff, fatOff + 4 * (root + 2));
       assert.notStrictEqual(fat.readUInt32LE(root * 4), 0, 'root directory has no FAT chain');
+      // Byte-parity rules with the reference mkpfs writer (ps5-ultrapack exfat_writer.py)
+      const whole = fs.readFileSync(img);
+      const heap = b.readUInt32LE(88) * 512, spcBytes = 512 << b[109], clusters = b.readUInt32LE(92);
+      const rootOff = heap + (root - 2) * spcBytes;
+      assert.strictEqual(whole[rootOff], 0x83, 'first root entry is the volume label');
+      assert.ok(whole.subarray(rootOff + 1, rootOff + 32).every(x => x === 0), 'volume label must be empty');
+      assert.strictEqual(whole[rootOff + 32], 0x81, 'second root entry is the allocation bitmap');
+      assert.strictEqual(Number(whole.readBigUInt64LE(rootOff + 32 + 24)), Math.ceil(clusters / 8), 'bitmap length = ceil(clusters/8)');
+      assert.strictEqual(whole.readUInt32LE(100), 0x4d6b5046, 'fixed volume serial');
       if (haveFsck) {
         const r = sh('fsck.exfat', [img]);
         assert.strictEqual(r.status, 0, r.stdout + r.stderr);
