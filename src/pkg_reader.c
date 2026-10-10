@@ -531,6 +531,8 @@ struct pkgr {
     pfsc_layer_t *pfsc;
     pfs_t inner;
     int inner_ok;
+    int oom;               /* set when an allocation failed while building the listing */
+    uint8_t *dir_seen;     /* one flag per inner inode: a directory may be walked only once */
 
     entry_t *ents;
     size_t n_ents, cap_ents;
@@ -557,6 +559,8 @@ static void free_entries(pkgr_t *p) {
 
 static void free_stack(pkgr_t *p) {
     free_entries(p);
+    free(p->dir_seen);
+    p->dir_seen = NULL;
     if (p->inner_ok) pfs_free(&p->inner);
     p->inner_ok = 0;
     if (p->pfsc) {
@@ -592,13 +596,19 @@ static entry_t *add_entry(pkgr_t *p, const char *dirprefix, const uint8_t *name,
     if (p->n_ents == p->cap_ents) {
         size_t nc = p->cap_ents ? p->cap_ents * 2 : 64;
         entry_t *ne = realloc(p->ents, nc * sizeof *ne);
-        if (!ne) return NULL;
+        if (!ne) {
+            p->oom = 1;
+            return NULL;
+        }
         p->ents = ne;
         p->cap_ents = nc;
     }
     size_t pl = strlen(dirprefix);
     char *path = malloc(pl + 1 + nl + 1);
-    if (!path) return NULL;
+    if (!path) {
+        p->oom = 1;
+        return NULL;
+    }
     memcpy(path, dirprefix, pl);
     if (pl) path[pl++] = '/';
     memcpy(path + pl, name, nl);
@@ -676,6 +686,18 @@ static int walk_collect(void *c, uint32_t ino, int type, const uint8_t *name, si
 
 static int walk_dir(pkgr_t *p, uint64_t dir, const char *prefix, int depth) {
     if (depth > MAX_DEPTH) return -1;
+    /* A directory inode may be reached once; a corrupt image whose directory lists itself
+     * (or an ancestor) twice would otherwise recurse exponentially. */
+    if (dir >= p->inner.ninodes) return -1;
+    if (!p->dir_seen) {
+        p->dir_seen = calloc((size_t)p->inner.ninodes, 1);
+        if (!p->dir_seen) {
+            p->oom = 1;
+            return -1;
+        }
+    }
+    if (p->dir_seen[dir]) return -1;
+    p->dir_seen[dir] = 1;
     walk_ctx_t w;
     memset(&w, 0, sizeof w);
     w.p = p;
@@ -691,7 +713,13 @@ static int walk_dir(pkgr_t *p, uint64_t dir, const char *prefix, int depth) {
             break;
         }
         entry_t *e = add_entry(p, prefix, w.files[i].name, w.files[i].nl, 1);
-        if (!e) continue; /* unsafe name (skipped) */
+        if (!e) {
+            if (p->oom) {
+                rc = -1;
+                break;
+            }
+            continue; /* unsafe name (skipped) */
+        }
         if (fmap_build(&p->inner, w.files[i].ino, &e->fm)) {
             rc = -1;
             break;
@@ -701,7 +729,13 @@ static int walk_dir(pkgr_t *p, uint64_t dir, const char *prefix, int depth) {
     }
     for (size_t i = 0; i < w.ndirs && !rc; i++) {
         entry_t *e = add_entry(p, prefix, w.dirs[i].name, w.dirs[i].nl, 0);
-        if (!e) continue;
+        if (!e) {
+            if (p->oom) {
+                rc = -1;
+                break;
+            }
+            continue;
+        }
         char *sub = strdup(e->path); /* e may be invalidated by recursion */
         if (!sub) {
             rc = -1;
@@ -741,7 +775,10 @@ static int add_cnt_files(pkgr_t *p, const uint8_t *names, size_t names_len) {
         full[8 + nl] = 0;
         if (find_path(p, full) >= 0) continue;
         entry_t *e = add_entry(p, "sce_sys", names + noff, nl, 2);
-        if (!e) continue;
+        if (!e) {
+            if (p->oom) return -1;
+            continue;
+        }
         e->cnt_off = off;
         e->pub.size = size;
         p->total += size;
@@ -926,7 +963,7 @@ static int build_stack(pkgr_t *p, int new_crypt, const uint8_t *names, size_t na
         return -1;
     }
     if (walk_dir(p, (uint64_t)iroot, "", 0)) {
-        set_err(p, "inner PFS directory walk failed");
+        set_err(p, p->oom ? "out of memory" : "inner PFS directory walk failed (corrupt or cyclic)");
         return -1;
     }
     if (add_cnt_files(p, names, names_len)) goto oom;
