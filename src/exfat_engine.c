@@ -51,10 +51,20 @@ static void put64_le(uint8_t *p, uint64_t v) {
   put32_le(p + 4, (uint32_t)(v >> 32));
 }
 
+/* OS-generated metadata never packed into an image; mirrors IGNORED_NAMES in
+ * ps5-ultrapack backend/mkpfs/utils.py (case-insensitive, "._*" by prefix). */
 static bool is_ignored(const char *name) {
-  if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".DS_Store") ||
-      !strcmp(name, "Thumbs.db") || !strncmp(name, "._", 2)) {
-    return true;
+  static const char *const ignored[] = {
+    ".", "..",
+    ".ds_store", ".spotlight-v100", ".trashes", ".fseventsd", ".temporaryitems",
+    ".documentrevisions-v100", ".apdisk", "__macosx", ".volumeicon.icns",
+    ".localized", ".appledouble", ".lsoverride", "icon\r",
+    "thumbs.db", "ehthumbs.db", "desktop.ini", "$recycle.bin",
+    "system volume information",
+  };
+  if (!strncmp(name, "._", 2)) return true;
+  for (size_t i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++) {
+    if (!strcasecmp(name, ignored[i])) return true;
   }
   return false;
 }
@@ -329,20 +339,15 @@ static int write_directory_cluster(FILE *fout, const exfat_file_node_t *dir, boo
 
   size_t offset = 0;
   if (is_root) {
-    /* Volume label */
+    /* Volume label: empty, as in the reference mkpfs writer */
     buf[offset] = 0x83;
-    buf[offset + 1] = 4;
-    const char *lbl = "GAME";
-    for (int i = 0; i < 4; i++) {
-      put16_le(buf + offset + 2 + i * 2, (uint8_t)lbl[i]);
-    }
     offset += 32;
 
     /* Allocation Bitmap Directory Entry */
     buf[offset] = 0x81;
     buf[offset + 1] = 0;
     put32_le(buf + offset + 20, bitmap_first_cluster);
-    put64_le(buf + offset + 24, (uint64_t)cluster_count / 8 + 1);
+    put64_le(buf + offset + 24, (uint64_t)ceil_div32(cluster_count, 8));
     offset += 32;
 
     /* Up-case Table Directory Entry */
@@ -425,6 +430,24 @@ static int write_tree_content(FILE *fout, const exfat_file_node_t *dir,
     }
   }
   return 0;
+}
+
+/* Link `count` contiguous clusters starting at `first` into a FAT chain. */
+static void fat_chain(uint8_t *fat, uint32_t first, uint32_t count) {
+  if (!count) return;
+  for (uint32_t i = 0; i + 1 < count; i++) {
+    put32_le(fat + (size_t)(first + i) * 4, first + i + 1);
+  }
+  put32_le(fat + (size_t)(first + count - 1) * 4, FAT_ENTRY_EOC);
+}
+
+static void fat_walk_chains(uint8_t *fat, const exfat_file_node_t *n) {
+  if (n->first_cluster >= 2 && n->cluster_count > 0) {
+    fat_chain(fat, n->first_cluster, n->cluster_count);
+  }
+  for (size_t i = 0; i < n->child_count; i++) {
+    fat_walk_chains(fat, n->children[i]);
+  }
 }
 
 int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
@@ -539,6 +562,9 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   if (!fat) { fclose(fout); free_exfat_tree(root); unlink(out_image_path); return -1; }
   put32_le(fat + 0, FAT_ENTRY_MEDIA);
   put32_le(fat + 4, FAT_ENTRY_EOC);
+  fat_chain(fat, BITMAP_FIRST_CLUSTER, bitmap_clusters);
+  fat_chain(fat, BITMAP_FIRST_CLUSTER + bitmap_clusters, upcase_clusters);
+  fat_walk_chains(fat, root);
 
   if (fwrite(fat, 1, fat_bytes, fout) != fat_bytes) {
     snprintf(err_msg, err_len, "Failed writing FAT");
