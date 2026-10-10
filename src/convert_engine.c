@@ -1,9 +1,10 @@
 #include "convert_engine.h"
 #include "pkg_reader.h"
 #include <time.h>
-#ifndef __linux__
+#if defined(__FreeBSD__) || defined(__PROSPERO__)
 #include <sys/param.h>
 #include <sys/cpuset.h>
+#define WUP_HAVE_CPUSET 1
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,7 +177,7 @@ static double mono_s(void) {
  * Best effort: try to widen the affinity to every online CPU, then report what we got. */
 static int pfsc_usable_cpus(long online) {
   if (online < 1) online = 1;
-#ifndef __linux__
+#ifdef WUP_HAVE_CPUSET
   if (online > CPU_SETSIZE) online = CPU_SETSIZE;
   cpuset_t cur, want;
   int before = -1, after = -1, setrc = 0, seterr = 0;
