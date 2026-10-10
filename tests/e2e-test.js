@@ -290,6 +290,24 @@ async function main() {
       c.close(); fs.unlinkSync(big);
     });
 
+    await test('CANCEL mid-stream folder -> ffpfsc aborts and leaves no output or temp files', async () => {
+      const ct = path.join(work, 'canceltree'); fs.mkdirSync(ct);
+      for (let i = 0; i < 6; i++) fs.writeFileSync(path.join(ct, `r${i}.bin`), require('crypto').randomBytes(40 * 1024 * 1024));
+      const cout = path.join(work, 'cancel_out'); fs.mkdirSync(cout);
+      const c = new Client(); await c.ready();
+      c.send(frame(T.CONVERT, 21, Buffer.from(`${ct}
+${cout}
+ffpfsc`)));
+      await c.until(f => f.type === T.PROGRESS && f.rid === 21n);
+      c.send(frame(T.CANCEL, 21));
+      const end = await c.until(f => (f.type === T.ERROR || f.type === T.DONE) && f.rid === 21n);
+      assert.strictEqual(end.type, T.ERROR, 'conversion finished before the cancel landed');
+      assert.match(end.payload, /cancel/i);
+      assert.deepStrictEqual(fs.readdirSync(cout), [], 'cancel must leave no partial output or temp files');
+      c.close();
+      fs.rmSync(ct, { recursive: true, force: true });
+    });
+
     // ---------- success-path validation ----------
     await test('folder -> exfat produces an image that fsck.exfat accepts', async function () {
       const f = await convert(tree, out, 'exfat', 11);
