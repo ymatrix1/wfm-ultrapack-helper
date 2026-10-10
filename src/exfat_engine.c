@@ -59,6 +59,67 @@ static bool is_ignored(const char *name) {
   return false;
 }
 
+/* UTF-8 to UTF-16 conversion for exFAT directory names */
+static size_t utf8_to_utf16(const char *utf8, uint16_t *utf16, size_t max_utf16) {
+  size_t in_len = strlen(utf8);
+  size_t i = 0;
+  size_t out_len = 0;
+
+  while (i < in_len && out_len < max_utf16) {
+    uint32_t cp = 0;
+    unsigned char c = (unsigned char)utf8[i];
+
+    if (c < 0x80) {
+      cp = c;
+      i += 1;
+    } else if ((c & 0xE0) == 0xC0) {
+      if (i + 1 >= in_len) break;
+      cp = ((c & 0x1F) << 6) | (utf8[i + 1] & 0x3F);
+      i += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      if (i + 2 >= in_len) break;
+      cp = ((c & 0x0F) << 12) | ((utf8[i + 1] & 0x3F) << 6) | (utf8[i + 2] & 0x3F);
+      i += 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      if (i + 3 >= in_len) break;
+      cp = ((c & 0x07) << 18) | ((utf8[i + 1] & 0x3F) << 12) | ((utf8[i + 2] & 0x3F) << 6) | (utf8[i + 3] & 0x3F);
+      i += 4;
+    } else {
+      i += 1;
+      continue;
+    }
+
+    if (cp <= 0xFFFF) {
+      utf16[out_len++] = (uint16_t)cp;
+    } else if (cp <= 0x10FFFF) {
+      if (out_len + 2 > max_utf16) break;
+      cp -= 0x10000;
+      utf16[out_len++] = (uint16_t)(0xD800 + (cp >> 10));
+      utf16[out_len++] = (uint16_t)(0xDC00 + (cp & 0x3FF));
+    }
+  }
+  return out_len;
+}
+
+static uint16_t upcase_lookup(uint16_t ch) {
+  if (ch * 2 + 1 < sizeof(UPCASE_TABLE)) {
+    return (uint16_t)UPCASE_TABLE[ch * 2] | ((uint16_t)UPCASE_TABLE[ch * 2 + 1] << 8);
+  }
+  return ch;
+}
+
+static uint16_t exfat_name_hash(const uint16_t *utf16, size_t len) {
+  uint16_t h = 0;
+  for (size_t i = 0; i < len; i++) {
+    uint16_t ch = upcase_lookup(utf16[i]);
+    uint8_t b0 = (uint8_t)(ch & 0xFF);
+    uint8_t b1 = (uint8_t)(ch >> 8);
+    h = (uint16_t)((((h << 15) | (h >> 1)) & 0xFFFF) + b0);
+    h = (uint16_t)((((h << 15) | (h >> 1)) & 0xFFFF) + b1);
+  }
+  return h;
+}
+
 static int node_cmp(const void *a, const void *b) {
   const exfat_file_node_t *na = *(const exfat_file_node_t **)a;
   const exfat_file_node_t *nb = *(const exfat_file_node_t **)b;
@@ -69,8 +130,13 @@ static exfat_file_node_t *create_node(const char *name, const char *rel, const c
   exfat_file_node_t *n = (exfat_file_node_t *)calloc(1, sizeof(exfat_file_node_t));
   if (!n) return NULL;
   n->name = strdup(name);
+  if (!n->name) { free(n); return NULL; }
   n->rel_path = strdup(rel ? rel : "");
-  if (abs) n->abs_path = strdup(abs);
+  if (!n->rel_path) { free(n->name); free(n); return NULL; }
+  if (abs) {
+    n->abs_path = strdup(abs);
+    if (!n->abs_path) { free(n->rel_path); free(n->name); free(n); return NULL; }
+  }
   n->is_dir = is_dir;
   n->size = sz;
   return n;
@@ -105,8 +171,16 @@ static int scan_directory(const char *abs_dir, const char *rel_dir, exfat_file_n
       snprintf(sub_rel, sizeof(sub_rel), "%s", ent->d_name);
     }
 
+    /* Use lstat to avoid following recursive symlinks */
     struct stat st;
-    if (stat(sub_abs, &st) != 0) continue;
+    if (lstat(sub_abs, &st) != 0) {
+      closedir(d);
+      return -1;
+    }
+    if (S_ISLNK(st.st_mode)) {
+      /* Skip symlinks to prevent loops and bad targets */
+      continue;
+    }
 
     bool is_dir = S_ISDIR(st.st_mode);
     uint64_t sz = is_dir ? 0 : (uint64_t)st.st_size;
@@ -124,13 +198,22 @@ static int scan_directory(const char *abs_dir, const char *rel_dir, exfat_file_n
     parent->children[parent->child_count++] = child;
 
     if (is_dir) {
-      scan_directory(sub_abs, sub_rel, child);
+      if (scan_directory(sub_abs, sub_rel, child) != 0) {
+        closedir(d);
+        return -1;
+      }
     }
   }
 
   closedir(d);
   if (parent->child_count > 1) {
     qsort(parent->children, parent->child_count, sizeof(exfat_file_node_t *), node_cmp);
+    /* Detect case-insensitive duplicates */
+    for (size_t i = 1; i < parent->child_count; i++) {
+      if (!strcasecmp(parent->children[i - 1]->name, parent->children[i]->name)) {
+        return -1; /* Duplicate entry under exFAT */
+      }
+    }
   }
   return 0;
 }
@@ -139,8 +222,9 @@ static uint32_t directory_entry_count(const exfat_file_node_t *node, bool is_roo
   uint32_t count = is_root ? 3 : 0; /* root has Label + Bitmap + Upcase */
   for (size_t i = 0; i < node->child_count; i++) {
     const exfat_file_node_t *c = node->children[i];
-    uint32_t name_len = (uint32_t)strlen(c->name);
-    uint32_t name_entries = ceil_div32(name_len, NAME_CHARS_PER_ENTRY);
+    uint16_t u16[260];
+    size_t u16_len = utf8_to_utf16(c->name, u16, 255);
+    uint32_t name_entries = ceil_div32((uint32_t)u16_len, NAME_CHARS_PER_ENTRY);
     count += 2 + name_entries;
   }
   return count;
@@ -149,19 +233,19 @@ static uint32_t directory_entry_count(const exfat_file_node_t *node, bool is_roo
 static uint32_t calc_node_clusters(const exfat_file_node_t *node, bool is_root) {
   if (node->is_dir) {
     uint32_t entries = directory_entry_count(node, is_root);
-    uint32_t bytes = entries * 32U;
-    uint32_t cl = ceil_div32(bytes, CLUSTER_SIZE);
-    return cl ? cl : 1;
+    uint64_t bytes = (uint64_t)entries * 32U;
+    return (uint32_t)ceil_div32(bytes ? bytes : 32U, CLUSTER_SIZE);
   }
-  return ceil_div32(node->size, CLUSTER_SIZE);
+  if (node->size == 0) return 0;
+  return (uint32_t)ceil_div32(node->size, CLUSTER_SIZE);
 }
 
-static void count_all_clusters(const exfat_file_node_t *node, uint32_t *acc) {
+static void count_all_clusters(const exfat_file_node_t *node, uint32_t *total) {
   for (size_t i = 0; i < node->child_count; i++) {
-    const exfat_file_node_t *c = node->children[i];
-    *acc += calc_node_clusters(c, false);
+    exfat_file_node_t *c = node->children[i];
+    *total += calc_node_clusters(c, false);
     if (c->is_dir) {
-      count_all_clusters(c, acc);
+      count_all_clusters(c, total);
     }
   }
 }
@@ -180,18 +264,6 @@ static void assign_clusters_recursive(exfat_file_node_t *node, uint32_t *next_cl
   }
 }
 
-static uint16_t exfat_name_hash(const char *name) {
-  uint16_t h = 0;
-  for (const char *p = name; *p; p++) {
-    uint16_t ch = (uint8_t)toupper((unsigned char)*p);
-    uint8_t b0 = (uint8_t)(ch & 0xFF);
-    uint8_t b1 = 0;
-    h = (uint16_t)((((h << 15) | (h >> 1)) & 0xFFFF) + b0);
-    h = (uint16_t)((((h << 15) | (h >> 1)) & 0xFFFF) + b1);
-  }
-  return h;
-}
-
 static uint16_t entry_set_checksum(const uint8_t *entries, size_t len) {
   uint16_t cs = 0;
   for (size_t i = 0; i < len; i++) {
@@ -202,8 +274,9 @@ static uint16_t entry_set_checksum(const uint8_t *entries, size_t len) {
 }
 
 static size_t build_file_entries(const exfat_file_node_t *child, uint8_t *out, size_t cap) {
-  uint32_t name_len = (uint32_t)strlen(child->name);
-  uint32_t name_entries = ceil_div32(name_len, NAME_CHARS_PER_ENTRY);
+  uint16_t u16[260];
+  size_t u16_len = utf8_to_utf16(child->name, u16, 255);
+  uint32_t name_entries = ceil_div32((uint32_t)u16_len, NAME_CHARS_PER_ENTRY);
   size_t total_len = (2 + name_entries) * 32U;
   if (total_len > cap) return 0;
 
@@ -221,21 +294,21 @@ static size_t build_file_entries(const exfat_file_node_t *child, uint8_t *out, s
   stream[0] = 0xC0;
   bool has_alloc = (child->first_cluster >= 2);
   stream[1] = has_alloc ? FLAG_ALLOCATION_POSSIBLE : 0x00;
-  stream[3] = (uint8_t)name_len;
-  put16_le(stream + 4, exfat_name_hash(child->name));
+  stream[3] = (uint8_t)u16_len;
+  put16_le(stream + 4, exfat_name_hash(u16, u16_len));
   uint64_t data_len = child->is_dir ? ((uint64_t)child->cluster_count * CLUSTER_SIZE) : child->size;
   put64_le(stream + 8, data_len);
   put32_le(stream + 20, has_alloc ? child->first_cluster : 0);
   put64_le(stream + 24, data_len);
 
-  /* File name entries */
+  /* File name entries in UTF-16 LE */
   for (uint32_t i = 0; i < name_entries; i++) {
     uint8_t *ne = out + (2 + i) * 32;
     ne[0] = 0xC1;
     for (uint32_t k = 0; k < 15; k++) {
       uint32_t pos = i * 15 + k;
-      if (pos < name_len) {
-        put16_le(ne + 2 + k * 2, (uint8_t)child->name[pos]);
+      if (pos < u16_len) {
+        put16_le(ne + 2 + k * 2, u16[pos]);
       } else {
         put16_le(ne + 2 + k * 2, 0);
       }
@@ -258,16 +331,23 @@ static int write_directory_cluster(FILE *fout, const exfat_file_node_t *dir, boo
   if (is_root) {
     /* Volume label */
     buf[offset] = 0x83;
+    buf[offset + 1] = 4;
+    const char *lbl = "GAME";
+    for (int i = 0; i < 4; i++) {
+      put16_le(buf + offset + 2 + i * 2, (uint8_t)lbl[i]);
+    }
     offset += 32;
 
-    /* Allocation bitmap */
+    /* Allocation Bitmap Directory Entry */
     buf[offset] = 0x81;
+    buf[offset + 1] = 0;
     put32_le(buf + offset + 20, bitmap_first_cluster);
-    put64_le(buf + offset + 24, ceil_div32(cluster_count, 8));
+    put64_le(buf + offset + 24, (uint64_t)cluster_count / 8 + 1);
     offset += 32;
 
-    /* Up-case table */
+    /* Up-case Table Directory Entry */
     buf[offset] = 0x82;
+    buf[offset + 1] = 0;
     put32_le(buf + offset + 4, UPCASE_CHECKSUM);
     put32_le(buf + offset + 20, bitmap_first_cluster + bitmap_clusters);
     put64_le(buf + offset + 24, UPCASE_TABLE_LEN);
@@ -275,35 +355,27 @@ static int write_directory_cluster(FILE *fout, const exfat_file_node_t *dir, boo
   }
 
   for (size_t i = 0; i < dir->child_count; i++) {
-    size_t wrote = build_file_entries(dir->children[i], buf + offset, buf_size - offset);
-    offset += wrote;
+    const exfat_file_node_t *child = dir->children[i];
+    uint8_t entry_buf[32 * 20];
+    size_t elen = build_file_entries(child, entry_buf, sizeof(entry_buf));
+    if (elen == 0 || offset + elen > buf_size) {
+      free(buf);
+      return -1;
+    }
+    memcpy(buf + offset, entry_buf, elen);
+    offset += elen;
   }
 
-  size_t nw = fwrite(buf, 1, buf_size, fout);
+  size_t written = fwrite(buf, 1, buf_size, fout);
   free(buf);
-  return (nw == buf_size) ? 0 : -1;
-}
-
-static void fat_chain(uint8_t *fat, uint32_t first, uint32_t count) {
-  for (uint32_t i = 0; i < count - 1; i++) {
-    put32_le(fat + (first + i) * 4, first + i + 1);
-  }
-  put32_le(fat + (first + count - 1) * 4, FAT_ENTRY_EOC);
-}
-
-static void fat_walk_chains(uint8_t *fat, const exfat_file_node_t *n) {
-  if (n->first_cluster >= 2 && n->cluster_count > 0) {
-    fat_chain(fat, n->first_cluster, n->cluster_count);
-  }
-  for (size_t i = 0; i < n->child_count; i++) {
-    fat_walk_chains(fat, n->children[i]);
-  }
+  return (written == buf_size) ? 0 : -1;
 }
 
 static int write_tree_content(FILE *fout, const exfat_file_node_t *dir,
                               convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                               void *user_data, uint64_t total_bytes, uint64_t *done_bytes,
-                              uint32_t bitmap_first, uint32_t cluster_count, uint32_t bitmap_clusters) {
+                              uint32_t bitmap_first, uint32_t cluster_count, uint32_t bitmap_clusters,
+                              uint8_t *copy_buf, size_t copy_buf_sz) {
   /* Write children files, and recurse on subdirs */
   for (size_t i = 0; i < dir->child_count; i++) {
     if (cancel_cb && cancel_cb(user_data)) return -2;
@@ -317,21 +389,21 @@ static int write_tree_content(FILE *fout, const exfat_file_node_t *dir,
       if (progress_cb) progress_cb(total_bytes, *done_bytes, user_data);
 
       int ret = write_tree_content(fout, c, progress_cb, cancel_cb, user_data,
-                                  total_bytes, done_bytes, bitmap_first, cluster_count, bitmap_clusters);
+                                  total_bytes, done_bytes, bitmap_first, cluster_count, bitmap_clusters,
+                                  copy_buf, copy_buf_sz);
       if (ret != 0) return ret;
     } else {
-      /* Stream file body directly into output with zero disk staging */
+      /* Stream file body directly into output */
       if (c->size > 0 && c->abs_path) {
         FILE *fin = fopen(c->abs_path, "rb");
         if (!fin) return -1;
 
-        uint8_t buffer[64 * 1024];
         uint64_t rem = c->size;
         while (rem > 0) {
           if (cancel_cb && cancel_cb(user_data)) { fclose(fin); return -2; }
-          size_t chunk = (rem > sizeof(buffer)) ? sizeof(buffer) : (size_t)rem;
-          if (fread(buffer, 1, chunk, fin) != chunk) { fclose(fin); return -1; }
-          if (fwrite(buffer, 1, chunk, fout) != chunk) { fclose(fin); return -1; }
+          size_t chunk = (rem > copy_buf_sz) ? copy_buf_sz : (size_t)rem;
+          if (fread(copy_buf, 1, chunk, fin) != chunk) { fclose(fin); return -1; }
+          if (fwrite(copy_buf, 1, chunk, fout) != chunk) { fclose(fin); return -1; }
           rem -= chunk;
           *done_bytes += chunk;
           if (progress_cb) progress_cb(total_bytes, *done_bytes, user_data);
@@ -365,7 +437,7 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   }
 
   if (scan_directory(source_dir, "", root) != 0) {
-    snprintf(err_msg, err_len, "Failed to scan source directory: %s", strerror(errno));
+    snprintf(err_msg, err_len, "Failed scanning source directory (symlink loop, duplicate, or unreadable file)");
     free_exfat_tree(root);
     return -1;
   }
@@ -428,23 +500,22 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   boot_region[112] = 0xFF;
   put16_le(boot_region + 510, 0xAA55);
 
-  for (int i = 1; i <= 8; i++) {
-    put32_le(boot_region + (i + 1) * BYTES_PER_SECTOR - 4, 0xAA550000U);
+  for (size_t s = 1; s <= 8; s++) {
+    put16_le(boot_region + s * BYTES_PER_SECTOR + 510, 0xAA55);
   }
 
-  uint32_t boot_csum = 0;
+  uint32_t bchk = 0;
   for (size_t i = 0; i < 11 * BYTES_PER_SECTOR; i++) {
     if (i == 106 || i == 107 || i == 112) continue;
-    boot_csum = (((boot_csum << 31) | (boot_csum >> 1)) & 0xFFFFFFFFU) + boot_region[i];
+    bchk = ((bchk << 31) | (bchk >> 1)) + boot_region[i];
   }
   for (size_t i = 0; i < BYTES_PER_SECTOR; i += 4) {
-    put32_le(boot_region + 11 * BYTES_PER_SECTOR + i, boot_csum);
+    put32_le(boot_region + 11 * BYTES_PER_SECTOR + i, bchk);
   }
 
-  /* Write Main + Backup Boot Sector */
   if (fwrite(boot_region, 1, sizeof(boot_region), fout) != sizeof(boot_region) ||
       fwrite(boot_region, 1, sizeof(boot_region), fout) != sizeof(boot_region)) {
-    snprintf(err_msg, err_len, "Failed writing exFAT boot sectors");
+    snprintf(err_msg, err_len, "Failed writing boot sectors: %s", strerror(errno));
     fclose(fout); free_exfat_tree(root); unlink(out_image_path);
     return -1;
   }
@@ -455,7 +526,7 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   while (pad_to_fat > 0) {
     size_t p = (pad_to_fat > sizeof(zero_buf)) ? sizeof(zero_buf) : pad_to_fat;
     if (fwrite(zero_buf, 1, p, fout) != p) {
-      snprintf(err_msg, err_len, "Failed writing FAT padding");
+      snprintf(err_msg, err_len, "Failed writing VBR padding");
       fclose(fout); free_exfat_tree(root); unlink(out_image_path);
       return -1;
     }
@@ -466,15 +537,11 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   size_t fat_bytes = fat_len_sectors * BYTES_PER_SECTOR;
   uint8_t *fat = (uint8_t *)calloc(1, fat_bytes);
   if (!fat) { fclose(fout); free_exfat_tree(root); unlink(out_image_path); return -1; }
-  put32_le(fat, FAT_ENTRY_MEDIA);
+  put32_le(fat + 0, FAT_ENTRY_MEDIA);
   put32_le(fat + 4, FAT_ENTRY_EOC);
 
-  fat_chain(fat, BITMAP_FIRST_CLUSTER, bitmap_clusters);
-  fat_chain(fat, BITMAP_FIRST_CLUSTER + bitmap_clusters, upcase_clusters);
-  fat_walk_chains(fat, root);
-
   if (fwrite(fat, 1, fat_bytes, fout) != fat_bytes) {
-    snprintf(err_msg, err_len, "Failed writing FAT table");
+    snprintf(err_msg, err_len, "Failed writing FAT");
     free(fat); fclose(fout); free_exfat_tree(root); unlink(out_image_path);
     return -1;
   }
@@ -532,11 +599,21 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   }
 
   /* 6. Recursive Content & Files */
+  uint8_t *heap_copy_buf = (uint8_t *)malloc(CLUSTER_SIZE);
+  if (!heap_copy_buf) {
+    fclose(fout);
+    free_exfat_tree(root);
+    unlink(out_image_path);
+    return -1;
+  }
+
   uint64_t done_bytes = (uint64_t)heap_offset * BYTES_PER_SECTOR +
                         (uint64_t)(bitmap_clusters + upcase_clusters + root->cluster_count) * CLUSTER_SIZE;
   int res = write_tree_content(fout, root, progress_cb, cancel_cb, user_data,
-                               total_bytes, &done_bytes, BITMAP_FIRST_CLUSTER, cluster_count, bitmap_clusters);
+                               total_bytes, &done_bytes, BITMAP_FIRST_CLUSTER, cluster_count, bitmap_clusters,
+                               heap_copy_buf, CLUSTER_SIZE);
 
+  free(heap_copy_buf);
   free_exfat_tree(root);
 
   if (res == -2) {
@@ -545,7 +622,7 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
     unlink(out_image_path);
     return -2;
   } else if (res != 0) {
-    snprintf(err_msg, err_len, "Failed writing exFAT tree stream");
+    snprintf(err_msg, err_len, "Failed writing exFAT tree stream: %s", strerror(errno));
     fclose(fout);
     unlink(out_image_path);
     return -1;

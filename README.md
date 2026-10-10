@@ -1,63 +1,24 @@
 # wfm-ultrapack-helper
 
-Standalone high-performance PS5 companion helper daemon for [PS5 Web File Manager](https://github.com/owendswang/ps5-web-file-manager). It brings the game format conversion and packaging features of [PS5 UltraPack](https://github.com/owendswang/ps5-web-file-manager) directly to the console with minimal temporary disk usage.
+Standalone high-performance PS5 companion helper daemon for [PS5 Web File Manager](https://github.com/ymatrix1/ps5-web-file-manager). It brings game format conversion and packaging features directly to the console with optimized disk and streaming pipelines.
 
-## Highlights & Zero-Staging Architecture
+## Features & Architecture
 
-- **Zero intermediate extraction (Minimal Disk Footprint):**
-  - Traditional tools unpack a 50–100 GB game to disk, modify files, and re-pack to another image, multiplying free space requirements (up to 3×–4× disk space).
-  - `wfm-ultrapack-helper` reads the inner PPR-PFS filesystem via random-access NAPS block streaming (`InnerImage` plan).
-  - Streams blocks directly from the `.pkg` into the compressed PFS `.ffpfsc` encoder in 64 KiB chunks—**requiring only the final output file's disk space**.
 - **Supported Formats & Conversions:**
-  - **Folder dump (`/app0`)** ➔ **`.exfat`** (contiguous cluster forward-only layout)
-  - **Folder dump (`/app0`)** ➔ **`.ffpfsc`** (outer PFSC zlib compressed container for ShadowMountPlus)
-  - **`.pkg` (fPKG)** ➔ **`.ffpfsc`** / **`.exfat`**
-  - **Raw / `.exfat` Image** ➔ **`.ffpfsc`** (64 KiB block compression with offset index)
-  - **`.ffpfsc` / `.ffpfs`** ➔ **`.pkg`** / `/app0` folder dump
-- **Auto-organization & naming:**
-  - Automatically identifies title ID, title name, app version, and minimum firmware tag:
-    `<Title> [<TitleID>] [v<Version>] [fw<FW>].ffpfsc`
-- **Non-blocking Daemon:**
+  - **Folder dump (`/app0`)** ➔ **`.exfat`**: Direct forward-only cluster serialization with zero intermediate scratch files.
+  - **Folder dump (`/app0`)** ➔ **`.ffpfsc`**: Direct pipeline via interim `.exfat` into compressed PFSC blocks with monotonic progress tracking.
+  - **Raw / `.exfat` Image** ➔ **`.ffpfsc`**: Streaming 64 KiB zlib compression with dynamic block offset index table.
+- **Robust Daemon & Multi-Threading:**
   - Listens on UNIX domain socket `/system_tmp/wfm-ultrapack-helper.sock` (or `/tmp/wfm-ultrapack-helper.sock` on Linux).
-  - Real-time progress, speed, ETA, and cooperative cancellation (`WUP_MSG_CANCEL`).
-
----
-
-## Zero-Staging Conversion Pipeline
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│  Source Input: .pkg (fPKG), Game Folder Dump (/app0), or Raw Image     │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-    ┌───────────────────────────────┴────────────────────────────────┐
-    │                                                                │
- [PKG / Container Source]                                  [Folder Dump Source]
-    │                                                                │
-    ├─ 1. Parse CNT & Outer Superblock                               ├─ 1. Scan tree & sort dirents
-    ├─ 2. Parse NAPS Layout & PPR-PFS Inodes                         ├─ 2. Assign contiguous clusters
-    └─ 3. In-memory Kraken/zlib span stream                          └─ 3. Compute VBR & FAT tables
-                                    │                                │
-                                    └───────────────┬────────────────┘
-                                                    │
-┌───────────────────────────────────────────────────▼────────────────────┐
-│  Direct In-Memory Streaming Engine (32 MiB rolling buffers)            │
-│  - Zero intermediate scratch files or multi-step staging on disk       │
-│  - Direct-to-stream exFAT serializer (VBR -> FAT -> Heap)              │
-│  - Direct-to-stream PFSC block encoder (64 KiB zlib chunks + offsets)  │
-└───────────────────────────────────────────────────┬────────────────────┘
-                                                    │
-                        Stream directly to target storage
-                                                    │
-┌───────────────────────────────────────────────────▼────────────────────┐
-│  Destination Target Format:                                            │
-│  • .ffpfsc (ShadowMountPlus compressed container)                      │
-│  • .exfat  (LVD/BFS fast-path mountable image)                         │
-│  • .pkg    (fPKG installable payload)                                  │
-│                                                                        │
-│  Disk space used: ~1x output only (no 2x-4x scratch footprint)         │
-└────────────────────────────────────────────────────────────────────────┘
-```
+  - Socket write synchronization via per-client mutex (`send_lock`) to guarantee clean, uncorrupted wire frames.
+  - Single active task guard (`busy` check) per client with cooperative cancellation (`WUP_MSG_CANCEL`).
+  - Progress updates throttled to ~4/sec (250 ms) to avoid overwhelming the socket buffer.
+  - Signal protection (`SIGPIPE` ignored; `SIGINT`/`SIGTERM` for graceful socket cleanup).
+  - Automatic error and transaction logging to `/data/wfm/helper.log`.
+- **Filesystem & Unicode Compliance:**
+  - Full UTF-8 to UTF-16 LE translation for directory entry file names.
+  - Official exFAT upcase table lookup for checksums and name hashing.
+  - `lstat` protection against symlink loops, duplicate entry collision checks, and heap-allocated transfer buffers.
 
 ---
 
@@ -88,11 +49,11 @@ make linux
 
 ## Testing & Quality Assurance
 
-Run the protocol framing and streaming tests:
+Run the protocol framing, concurrency, and format validation tests:
 ```bash
 npm test
 ```
-Or directly with Node.js (no dependencies required):
+Or directly with Node.js:
 ```bash
 node tests/protocol-test.js
 ```
@@ -101,4 +62,4 @@ node tests/protocol-test.js
 
 ## License
 
-This project is licensed under GPLv3. Third-party components retain their respective licenses (LibProsperoPkg / LibOrbisPkg GPL-3.0).
+This project is licensed under the GPL-3.0 License. Embedded `miniz` is licensed under the MIT License.
