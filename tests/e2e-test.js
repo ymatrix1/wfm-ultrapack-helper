@@ -211,6 +211,13 @@ async function main() {
       const f = await convert(emptyFile, out, 'ffpfsc');
       assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /empty/);
     });
+    await test('PKG (\x7fCNT) source is rejected, not silently wrapped', async () => {
+      const pkg = path.join(work, 'fake.pkg');
+      fs.writeFileSync(pkg, Buffer.concat([Buffer.from([0x7f, 0x43, 0x4e, 0x54]), Buffer.alloc(4096)]));
+      const f = await convert(pkg, out, 'ffpfsc');
+      assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /PKG packages are not supported/);
+      assert.ok(!fs.existsSync(path.join(out, 'fake.ffpfsc')));
+    });
     await test('exfat from a regular file -> ERROR', async () => {
       const f = await convert(smallImg, out, 'exfat');
       assert.strictEqual(f.type, T.ERROR); assert.match(f.payload, /already an image file/);

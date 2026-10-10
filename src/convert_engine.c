@@ -318,6 +318,19 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
   } else {
     /* If source is an exfat/raw image file and target is ffpfsc */
     if (!is_exfat_target) {
+      /* A .pkg is not a filesystem image: compressing it would silently produce
+       * a container that cannot be mounted. Reject until PKG extraction exists. */
+      FILE *probe = fopen(sanitized_source, "rb");
+      if (probe) {
+        unsigned char magic[4] = {0};
+        size_t got = fread(magic, 1, sizeof(magic), probe);
+        fclose(probe);
+        if (got == 4 && !memcmp(magic, "" "CNT", 4)) {
+          snprintf(err_msg, err_len,
+                   "PKG packages are not supported yet; extract to a folder, then convert the folder");
+          return -1;
+        }
+      }
       return convert_image_to_ffpfsc(sanitized_source, target_file, progress_cb, cancel_cb,
                                      user_data, err_msg, err_len);
     } else {
