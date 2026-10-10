@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { parseFfpfsc } = require('./ffpfsc-util');
 
 if (process.platform !== 'linux') {
   console.log('mt tests require Linux (AF_UNIX path socket); skipping.');
@@ -19,6 +20,7 @@ const BIN = path.join(ROOT, 'wfm-ultrapack-helper-linux');
 const SOCK = process.env.WUP_SOCKET || '/tmp/wfm-ultrapack-helper.sock';
 // Sanitizer builds distort timing: keep correctness checks, skip the speedup floor.
 const SANITIZED = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
+process.env.WUP_FIXED_TIME = '1700000000'; // PFS timestamps are time-based: pin them so sha256 identity holds
 const HEADER = 20;
 const T = { PING: 1, PONG: 2, CONVERT: 10, CANCEL: 11, PROGRESS: 21, ACCEPTED: 20, DONE: 24, ERROR: 25 };
 const MB = 1024 * 1024;
@@ -220,6 +222,21 @@ async function main() {
         });
       }
     }
+    await test('image -> ffpfsc (8 threads): PFS image + inner PFSC file inflate to the source image', async () => {
+      daemon = await startDaemon(8);
+      try {
+        const out = path.join(work, 'iparse_out'); fs.mkdirSync(out);
+        const r = await convert(path.join(imgDir, 'raw.img'), out, 55);
+        assert.strictEqual(r.type, T.DONE, r.payload);
+        const p = parseFfpfsc(fs.readFileSync(path.join(out, 'raw.ffpfsc')));
+        assert.strictEqual(p.innerName, 'raw.img');
+        const src = fs.readFileSync(path.join(imgDir, 'raw.img'));
+        assert.strictEqual(p.rawSize, src.length);
+        const inner = p.inflate();
+        assert.ok(inner.subarray(0, src.length).equals(src), 'inner image differs from the source');
+        assert.ok(inner.subarray(src.length).every(x => x === 0), 'padding must be zero');
+      } finally { await stopDaemon(daemon); daemon = null; }
+    });
     await test('image -> ffpfsc: WUP_THREADS=8 cancel removes the output and the daemon keeps working', async () => {
       daemon = await startDaemon(8);
       try {

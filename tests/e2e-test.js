@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const { spawn, spawnSync } = require('child_process');
+const { parseFfpfsc, unpfsc } = require('./ffpfsc-util');
 
 if (process.platform !== 'linux') {
   console.log('e2e tests require Linux (AF_UNIX path socket); skipping.');
@@ -19,6 +20,7 @@ const BIN = path.join(ROOT, 'wfm-ultrapack-helper-linux');
 const SOCK = process.env.WUP_SOCKET || '/tmp/wfm-ultrapack-helper.sock';
 // ASAN/UBSAN/TSAN builds run 5-50x slower: scale frame-wait timeouts.
 const SANITIZED = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
+process.env.WUP_FIXED_TIME = '1700000000';
 const HEADER = 20;
 const T = { PING: 1, PONG: 2, CONVERT: 10, CANCEL: 11, STATUS: 12, ACCEPTED: 20, PROGRESS: 21, DONE: 24, ERROR: 25 };
 
@@ -78,18 +80,7 @@ class Client {
   close() { this.sock.destroy(); }
 }
 
-// Decompress a .ffpfsc into the logical (block-padded) inner image.
-function unpfsc(d) {
-  const bs = Number(d.readBigUInt64LE(0x10)), tbl = Number(d.readBigUInt64LE(0x18));
-  const logical = Number(d.readBigUInt64LE(0x28));
-  const parts = [];
-  for (let i = 0; i < logical / bs; i++) {
-    const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
-    const chunk = d.subarray(a, e);
-    parts.push(chunk.length === bs ? chunk : zlib.inflateSync(chunk));
-  }
-  return Buffer.concat(parts);
-}
+// .ffpfsc = PFS image + one inner file (PFSC container): parse/inflate helpers live in ffpfsc-util.js.
 
 async function convert(src, dst, fmt, rid = 1) {
   const c = new Client();
@@ -392,31 +383,52 @@ ffpfsc`)));
         assert.match(r.stdout + r.stderr, /clean/);
       } else console.log('       (fsck.exfat not installed; structural checks only)');
     });
-    await test('image -> ffpfsc: header valid and every block inflates to the source', async () => {
+    await test('image -> ffpfsc: PFS image wrapping one PFSC file; every block inflates to the source', async () => {
       const f = await convert(smallImg, out, 'ffpfsc', 12);
       assert.strictEqual(f.type, T.DONE, f.payload);
       const d = fs.readFileSync(path.join(out, 'small.ffpfsc'));
-      assert.strictEqual(d.toString('ascii', 0, 4), 'PFSC');
-      const bs = Number(d.readBigUInt64LE(0x10)), tbl = Number(d.readBigUInt64LE(0x18));
-      const logical = Number(d.readBigUInt64LE(0x28));
-      assert.strictEqual(bs, 65536);
-      const blocks = Math.ceil(imgData.length / bs);
-      assert.strictEqual(logical, blocks * bs);
-      const rebuilt = [];
-      for (let i = 0; i < blocks; i++) {
-        const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
-        const chunk = d.subarray(a, e);
-        rebuilt.push(chunk.length === bs ? chunk : zlib.inflateSync(chunk));
-      }
-      const all = Buffer.concat(rebuilt).subarray(0, imgData.length);
+      assert.notStrictEqual(d.toString('ascii', 0, 4), 'PFSC', 'PFSC must not sit at file offset 0');
+      const p = parseFfpfsc(d);
+      assert.strictEqual(p.pfsHeader.version, 2);
+      assert.strictEqual(p.pfsHeader.blockSize, 65536);
+      assert.strictEqual(p.pfsHeader.mode, 0x8, 'unsigned, unencrypted, 32-bit inodes, case-insensitive');
+      assert.strictEqual(p.pfsHeader.readonly, 1);
+      assert.strictEqual(p.pfsHeader.inodeCount, 4);
+      assert.strictEqual(p.innerName, 'small.img');
+      assert.strictEqual(p.innerOffset, 6 * 65536, 'PFSC payload starts at block 6');
+      assert.strictEqual(p.rawSize, imgData.length);
+      assert.strictEqual(p.pfsc.lbs, 65536);
+      assert.strictEqual(p.pfsc.dataLength, Math.ceil(imgData.length / 65536) * 65536);
+      assert.strictEqual(p.blocks.length, Math.ceil(imgData.length / 65536));
+      assert.strictEqual(p.blocks[0].start, 0x10000, 'PFSC offsets are relative to the PFSC start');
+      assert.strictEqual(p.innerSize, p.blocks[p.blocks.length - 1].end);
+      assert.strictEqual(p.pfsHeader.ndblock, 6 + Math.ceil(p.innerSize / 65536));
+      assert.strictEqual(p.inodes[3].time, 1700000000, 'WUP_FIXED_TIME pins the PFS timestamps');
+      const all = p.inflate().subarray(0, imgData.length);
       assert.ok(all.equals(imgData), 'round-tripped data differs from source');
+    });
+    await test('image -> ffpfsc: inner file is named like ultrapack (title id / sanitized stem + extension)', async () => {
+      const o2 = path.join(work, 'names');
+      fs.mkdirSync(o2, { recursive: true });
+      const cases = [['PPSA28183-app_v1.EXFAT', 'PPSA28183.exfat'], ['My Game.exfat', 'My_Game.exfat'],
+                     ['a_very_long_image_name_here.img', 'a_very_long_ima.img']];
+      for (const [src, want] of cases) {
+        const sp = path.join(work, src);
+        fs.writeFileSync(sp, imgData.subarray(0, 70000));
+        const f = await convert(sp, o2, 'ffpfsc', 17);
+        assert.strictEqual(f.type, T.DONE, f.payload);
+        const outName = src.replace(/\.(pkg|exfat|img|iso)$/i, '') + '.ffpfsc';
+        assert.strictEqual(parseFfpfsc(fs.readFileSync(path.join(o2, outName))).innerName, want, src);
+      }
     });
     await test('folder -> ffpfsc: inner exfat is fsck-clean after decompress', async () => {
       const f = await convert(tree, out, 'ffpfsc', 13);
       assert.strictEqual(f.type, T.DONE, f.payload);
       assert.ok(!fs.existsSync(path.join(out, 'tree.tmp.exfat')), 'temp exfat must be removed');
       const img = path.join(work, 'inner.exfat');
-      fs.writeFileSync(img, unpfsc(fs.readFileSync(path.join(out, 'tree.ffpfsc'))));
+      const pf = parseFfpfsc(fs.readFileSync(path.join(out, 'tree.ffpfsc')));
+      assert.strictEqual(pf.innerName, 'tree.exfat');
+      fs.writeFileSync(img, pf.inflate());
       assert.strictEqual(fs.readFileSync(img).toString('ascii', 3, 11), 'EXFAT   ');
       if (haveFsck) {
         const r = sh('fsck.exfat', [img]);
@@ -468,16 +480,7 @@ ffpfsc`)));
     // ---------- real PS5 packages (skipped when the fixtures are absent) ----------
     const fixDir = process.env.PKG_FIXTURE_DIR || '/mnt/c/Users/yuri_/Downloads';
     const bs = 65536;
-    const inflateFfpfsc = file => {
-      const d = fs.readFileSync(file);
-      const tbl = Number(d.readBigUInt64LE(0x18)), logical = Number(d.readBigUInt64LE(0x28));
-      const parts = [];
-      for (let i = 0; i < logical / bs; i++) {
-        const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
-        const c = d.subarray(a, e); parts.push(c.length === bs ? c : zlib.inflateSync(c));
-      }
-      return Buffer.concat(parts);
-    };
+    const inflateFfpfsc = file => unpfsc(fs.readFileSync(file));
     for (const name of ['PS5_LAPY20012_v1.00.pkg', 'PS5_ITEM00001_v1.14.pkg']) {
       const pkgPath = path.join(fixDir, name);
       if (!fs.existsSync(pkgPath)) { console.log('  skip ' + name + ' (fixture not present)'); continue; }
@@ -504,6 +507,8 @@ ffpfsc`)));
         const f = await convert(pkgPath, out, 'ffpfsc', 32);
         assert.strictEqual(f.type, T.DONE, f.payload);
         assert.ok(!fs.readdirSync(out).some(n => /\.tmp/.test(n)), 'no temp files');
+        const pk = parseFfpfsc(fs.readFileSync(path.join(out, base + '.ffpfsc')));
+        assert.match(pk.innerName, /^[A-Z]{4}\d{5}\.exfat$/, 'inner file is <titleId>.exfat from param.json: ' + pk.innerName);
         const inner = inflateFfpfsc(path.join(out, base + '.ffpfsc'));
         const ex = fs.readFileSync(path.join(out, base + '.exfat'));
         assert.ok(inner.subarray(0, ex.length).equals(ex), 'ffpfsc payload differs from the exfat image');

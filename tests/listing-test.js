@@ -8,7 +8,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
+const { parseFfpfsc, unpfsc } = require('./ffpfsc-util');
 
+process.env.WUP_FIXED_TIME = '1700000000'; // deterministic PFS timestamps (inherited by the driver)
 const root = path.join(__dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-listing-'));
 process.on('exit', () => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) { /* best effort */ } });
@@ -50,18 +52,6 @@ function shuffled(es, seed) {
   const rnd = () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s; };
   for (let i = a.length - 1; i > 0; i--) { const j = rnd() % (i + 1); [a[i], a[j]] = [a[j], a[i]]; }
   return a;
-}
-function unpfsc(d) {
-  assert.strictEqual(d.toString('ascii', 0, 4), 'PFSC');
-  const bs = Number(d.readBigUInt64LE(0x10)), tbl = Number(d.readBigUInt64LE(0x18));
-  const logical = Number(d.readBigUInt64LE(0x28));
-  const parts = [];
-  for (let i = 0; i < logical / bs; i++) {
-    const a = Number(d.readBigUInt64LE(tbl + i * 8)), e = Number(d.readBigUInt64LE(tbl + (i + 1) * 8));
-    const chunk = d.subarray(a, e);
-    parts.push(chunk.length === bs ? chunk : zlib.inflateSync(chunk));
-  }
-  return Buffer.concat(parts);
 }
 function fsckClean(img) {
   if (!haveFsck) return;
@@ -171,7 +161,9 @@ test('wide directory (5000 entries, shuffled) == folder image, fsck clean', () =
 
 console.log('listing -> ffpfsc');
 test('ffpfsc from listing == folder -> ffpfsc, inner image == exFAT, fsck clean', () => {
-  const lo = path.join(ref.w, 'l.ffpfsc');
+  const lodir = path.join(ref.w, 'lout');
+  fs.mkdirSync(lodir);
+  const lo = path.join(lodir, 'tree.ffpfsc'); // same base name -> same inner file name as the folder path
   const r = drv('ffpfsc', writeSpec(ref.w, shuffled(base, 7), 'f.txt'), lo);
   ok(r, 'listing ffpfsc');
   const fo = path.join(ref.w, 'fout');
@@ -179,6 +171,8 @@ test('ffpfsc from listing == folder -> ffpfsc, inner image == exFAT, fsck clean'
   ok(drv('folder-ffpfsc', ref.mat, fo), 'folder ffpfsc');
   const folderPfsc = path.join(fo, 'tree.ffpfsc');
   assert.strictEqual(sha(lo), sha(folderPfsc));
+  const pf = parseFfpfsc(fs.readFileSync(lo));
+  assert.strictEqual(pf.innerName, 'tree.exfat');
   const inner = unpfsc(fs.readFileSync(lo));
   const exfat = fs.readFileSync(ref.folderImg);
   assert.ok(inner.subarray(0, exfat.length).equals(exfat), 'decompressed prefix differs from exFAT image');
