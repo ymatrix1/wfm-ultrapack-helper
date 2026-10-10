@@ -5,7 +5,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <zlib.h>
+#include "miniz.h"
 
 /* Minimal high-performance zlib streaming to outer PFSC format (.ffpfsc)
  * PFSC file structure:
