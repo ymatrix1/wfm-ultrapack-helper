@@ -119,6 +119,8 @@ typedef struct worker_job {
   uint64_t request_id;
 } worker_job_t;
 
+#include <signal.h>
+
 static void *conversion_worker_thread(void *arg) {
   worker_job_t *job = (worker_job_t *)arg;
   char err_msg[1024] = {0};
@@ -145,25 +147,31 @@ handle_client(void *arg) {
   char payload[8192];
   memset(&frame, 0, sizeof(frame));
   memset(payload, 0, sizeof(payload));
-  client_context_t ctx;
-  ctx.fd = fd;
-  ctx.request_id = 0;
-  ctx.cancel_requested = false;
+
+  client_context_t *ctx = (client_context_t *)calloc(1, sizeof(client_context_t));
+  if (!ctx) {
+    close(fd);
+    return NULL;
+  }
+  ctx->fd = fd;
+  ctx->request_id = 0;
+  ctx->cancel_requested = false;
   pthread_t worker_tid = 0;
+  bool worker_running = false;
 
   while (g_running) {
     int ret = recv_frame(fd, &frame, payload, sizeof(payload));
     if (ret <= 0) break;
 
-    ctx.request_id = frame.request_id;
+    ctx->request_id = frame.request_id;
 
     if (frame.type == WUP_MSG_PING) {
       send_frame(fd, WUP_MSG_PONG, frame.request_id, NULL, 0);
     } else if (frame.type == WUP_MSG_CANCEL) {
-      ctx.cancel_requested = true;
+      ctx->cancel_requested = true;
     } else if (frame.type == WUP_MSG_CONVERT) {
       /* Reset cancellation for fresh job */
-      ctx.cancel_requested = false;
+      ctx->cancel_requested = false;
       send_frame(fd, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
       worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
@@ -173,7 +181,7 @@ handle_client(void *arg) {
         continue;
       }
 
-      job->ctx = &ctx;
+      job->ctx = ctx;
       job->request_id = frame.request_id;
       strncpy(job->format, "ffpfsc", sizeof(job->format) - 1);
 
@@ -190,20 +198,39 @@ handle_client(void *arg) {
         const char *err = "Failed to spawn conversion thread";
         send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
       } else {
-        pthread_detach(worker_tid);
+        worker_running = true;
       }
     }
   }
 
-  /* Wait for or cancel any active worker */
-  ctx.cancel_requested = true;
+  /* If client disconnected mid-task, cancel active worker and join it */
+  ctx->cancel_requested = true;
+  if (worker_running) {
+    pthread_join(worker_tid, NULL);
+  }
+
   close(fd);
+  free(ctx);
   return NULL;
 }
 
 int main(void) {
   int server_fd;
   struct sockaddr_un addr;
+
+  /* Prevent process termination when writing to closed sockets */
+  signal(SIGPIPE, SIG_IGN);
+
+  /* Set up log file in /data/wfm/helper.log if directory exists */
+  mkdir("/data", 0777);
+  mkdir("/data/wfm", 0777);
+  FILE *log_fp = fopen("/data/wfm/helper.log", "a");
+  if (log_fp) {
+    dup2(fileno(log_fp), STDOUT_FILENO);
+    dup2(fileno(log_fp), STDERR_FILENO);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+  }
 
   unlink(WUP_HELPER_SOCKET);
   server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -245,5 +272,6 @@ int main(void) {
 
   close(server_fd);
   unlink(WUP_HELPER_SOCKET);
+  if (log_fp) fclose(log_fp);
   return 0;
 }
