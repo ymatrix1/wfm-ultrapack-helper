@@ -88,9 +88,22 @@ async function convert(src, dst, fmt, rid = 1) {
 const sh = (cmd, args) => spawnSync(cmd, args, { encoding: 'utf8' });
 const haveFsck = sh('which', ['fsck.exfat']).status === 0;
 
-function startDaemon() {
+// True when something is accepting connections on SOCK (a live daemon owns it).
+function socketIsLive() {
+  return new Promise(res => {
+    if (!fs.existsSync(SOCK)) return res(false);
+    const c = net.createConnection(SOCK);
+    c.once('connect', () => { c.destroy(); res(true); });
+    c.once('error', () => res(false));
+  });
+}
+
+async function startDaemon() {
   if (!fs.existsSync(BIN)) throw new Error('build the daemon first: make linux');
-  try { fs.unlinkSync(SOCK); } catch (_) {}
+  if (await socketIsLive()) {
+    throw new Error('another wfm-ultrapack-helper is already listening on ' + SOCK + '; stop it before running the e2e tests');
+  }
+  try { fs.unlinkSync(SOCK); } catch (_) {} // stale socket file only
   const p = spawn(BIN, [], { stdio: 'ignore' });
   return p;
 }
@@ -113,7 +126,7 @@ async function main() {
   const work = fs.mkdtempSync(path.join('/tmp', 'wup-e2e-'));
   const out = path.join(work, 'out');
   fs.mkdirSync(out);
-  const daemon = startDaemon();
+  const daemon = await startDaemon();
   try {
     await waitSocket();
 
