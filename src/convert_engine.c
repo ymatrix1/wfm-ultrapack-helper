@@ -339,10 +339,14 @@ static int pfsc_sink_finish(pfsc_sink_t *s) {
                            s->logical_size, s->err, sizeof(s->err));
 }
 
-/* Folder -> .ffpfsc with no staging image: exFAT chunks stream straight into the PFSC encoder. */
-static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpfsc_path,
-                                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
-                                    void *user_data, char *err_msg, size_t err_len) {
+/* Zero-staging .ffpfsc: an exFAT stream (folder or listing) feeds the PFSC encoder directly. */
+typedef int (*ffpfsc_stream_fn)(void *run_ctx, exfat_begin_fn begin_fn, exfat_sink_fn sink_fn, void *sink_ctx,
+                                convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                void *user_data, char *err_msg, size_t err_len);
+
+static int stream_to_ffpfsc(const char *out_ffpfsc_path, ffpfsc_stream_fn run, void *run_ctx,
+                            convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                            void *user_data, char *err_msg, size_t err_len) {
   pfsc_sink_t *s = (pfsc_sink_t *)calloc(1, sizeof(*s));
   if (!s) {
     snprintf(err_msg, err_len, "Out of memory");
@@ -355,8 +359,7 @@ static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpf
     return -1;
   }
 
-  int ret = convert_folder_to_exfat_stream(source_dir, pfsc_sink_begin, pfsc_sink_write, s,
-                                           progress_cb, cancel_cb, user_data, err_msg, err_len);
+  int ret = run(run_ctx, pfsc_sink_begin, pfsc_sink_write, s, progress_cb, cancel_cb, user_data, err_msg, err_len);
   if (ret == 0 && pfsc_sink_finish(s) != 0) ret = -1;
   if (ret == -1 && s->err[0]) snprintf(err_msg, err_len, "%s", s->err);
   uint64_t total = s->total_bytes;
@@ -373,6 +376,41 @@ static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpf
   }
   if (progress_cb) progress_cb(total, total, user_data);
   return 0;
+}
+
+static int run_folder_stream(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, void *sc,
+                             convert_progress_cb p, convert_cancel_cb c, void *u, char *e, size_t el) {
+  return convert_folder_to_exfat_stream((const char *)run_ctx, b, s, sc, p, c, u, e, el);
+}
+
+/* Folder -> .ffpfsc with no staging image: exFAT chunks stream straight into the PFSC encoder. */
+static int convert_folder_to_ffpfsc(const char *source_dir, const char *out_ffpfsc_path,
+                                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                    void *user_data, char *err_msg, size_t err_len) {
+  return stream_to_ffpfsc(out_ffpfsc_path, run_folder_stream, (void *)source_dir, progress_cb, cancel_cb,
+                          user_data, err_msg, err_len);
+}
+
+typedef struct {
+  const exfat_listing_entry_t *entries;
+  size_t count;
+  const exfat_src_ops_t *ops;
+  void *ops_ctx;
+} listing_stream_t;
+
+static int run_listing_stream(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, void *sc,
+                              convert_progress_cb p, convert_cancel_cb c, void *u, char *e, size_t el) {
+  const listing_stream_t *ls = (const listing_stream_t *)run_ctx;
+  return convert_listing_to_exfat_stream(ls->entries, ls->count, ls->ops, ls->ops_ctx, b, s, sc, p, c, u, e, el);
+}
+
+int convert_listing_to_ffpfsc(const exfat_listing_entry_t *entries, size_t count,
+                              const exfat_src_ops_t *ops, void *ops_ctx, const char *out_ffpfsc_path,
+                              convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                              void *user_data, char *err_msg, size_t err_len) {
+  listing_stream_t ls = { entries, count, ops, ops_ctx };
+  return stream_to_ffpfsc(out_ffpfsc_path, run_listing_stream, &ls, progress_cb, cancel_cb,
+                          user_data, err_msg, err_len);
 }
 
 int run_conversion(const char *source_path, const char *dest_path, const char *format_str,

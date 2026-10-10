@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ctype.h>
 
 #define BYTES_PER_SECTOR 512U
@@ -146,19 +147,17 @@ static int node_cmp(const void *a, const void *b) {
   return strcasecmp(na->name, nb->name);
 }
 
-static exfat_file_node_t *create_node(const char *name, const char *rel, const char *abs, bool is_dir, uint64_t sz) {
+static exfat_file_node_t *create_node(const char *name, size_t name_len, const char *rel, size_t rel_len,
+                                      bool is_dir, uint64_t sz, uint64_t file_id, bool declared) {
   exfat_file_node_t *n = (exfat_file_node_t *)calloc(1, sizeof(exfat_file_node_t));
   if (!n) return NULL;
-  n->name = strdup(name);
-  if (!n->name) { free(n); return NULL; }
-  n->rel_path = strdup(rel ? rel : "");
-  if (!n->rel_path) { free(n->name); free(n); return NULL; }
-  if (abs) {
-    n->abs_path = strdup(abs);
-    if (!n->abs_path) { free(n->rel_path); free(n->name); free(n); return NULL; }
-  }
+  n->name = strndup(name, name_len);
+  n->rel_path = strndup(rel, rel_len);
+  if (!n->name || !n->rel_path) { free(n->name); free(n->rel_path); free(n); return NULL; }
   n->is_dir = is_dir;
   n->size = sz;
+  n->file_id = file_id;
+  n->declared = declared;
   return n;
 }
 
@@ -170,11 +169,224 @@ void free_exfat_tree(exfat_file_node_t *root) {
   free(root->children);
   free(root->name);
   free(root->rel_path);
-  if (root->abs_path) free(root->abs_path);
   free(root);
 }
 
-static int scan_directory(const char *abs_dir, const char *rel_dir, exfat_file_node_t *parent) {
+/* ---- Listing -> node tree ------------------------------------------------------------------ */
+
+/* Open-addressing index of (parent, name) -> node so a flat listing in any order builds in ~O(n). */
+typedef struct {
+  const exfat_file_node_t *parent;
+  exfat_file_node_t *node;
+} child_slot_t;
+
+typedef struct {
+  child_slot_t *slots;
+  size_t cap;
+  size_t used;
+} child_index_t;
+
+static uint64_t child_hash(const exfat_file_node_t *parent, const char *name, size_t len) {
+  uint64_t h = 1469598103934665603ULL ^ (uint64_t)(uintptr_t)parent;
+  h *= 1099511628211ULL;
+  for (size_t i = 0; i < len; i++) {
+    h ^= (uint8_t)name[i];
+    h *= 1099511628211ULL;
+  }
+  return h ^ (h >> 29);
+}
+
+static exfat_file_node_t *index_find(const child_index_t *ix, const exfat_file_node_t *parent,
+                                     const char *name, size_t len) {
+  if (!ix->cap) return NULL;
+  size_t mask = ix->cap - 1;
+  for (size_t i = (size_t)child_hash(parent, name, len) & mask;; i = (i + 1) & mask) {
+    const child_slot_t *s = &ix->slots[i];
+    if (!s->node) return NULL;
+    if (s->parent == parent && !strncmp(s->node->name, name, len) && s->node->name[len] == '\0') return s->node;
+  }
+}
+
+static void index_insert_raw(child_index_t *ix, const exfat_file_node_t *parent, exfat_file_node_t *node) {
+  size_t mask = ix->cap - 1;
+  size_t i = (size_t)child_hash(parent, node->name, strlen(node->name)) & mask;
+  while (ix->slots[i].node) i = (i + 1) & mask;
+  ix->slots[i].parent = parent;
+  ix->slots[i].node = node;
+  ix->used++;
+}
+
+static int index_insert(child_index_t *ix, const exfat_file_node_t *parent, exfat_file_node_t *node) {
+  if ((ix->used + 1) * 2 > ix->cap) {
+    size_t new_cap = ix->cap ? ix->cap * 2 : 64;
+    child_index_t nx = { (child_slot_t *)calloc(new_cap, sizeof(child_slot_t)), new_cap, 0 };
+    if (!nx.slots) return -1;
+    for (size_t i = 0; i < ix->cap; i++) {
+      if (ix->slots[i].node) index_insert_raw(&nx, ix->slots[i].parent, ix->slots[i].node);
+    }
+    free(ix->slots);
+    *ix = nx;
+  }
+  index_insert_raw(ix, parent, node);
+  return 0;
+}
+
+/* Attach child under parent and register it in the index. Takes ownership of child on every path. */
+static int attach_child(child_index_t *ix, exfat_file_node_t *parent, exfat_file_node_t *child) {
+  if (!child) return -1;
+  if (parent->child_count >= parent->child_cap) {
+    size_t new_cap = parent->child_cap ? parent->child_cap * 2 : 16;
+    exfat_file_node_t **arr = (exfat_file_node_t **)realloc(parent->children, new_cap * sizeof(exfat_file_node_t *));
+    if (!arr) { free_exfat_tree(child); return -1; }
+    parent->children = arr;
+    parent->child_cap = new_cap;
+  }
+  parent->children[parent->child_count++] = child; /* tree owns it from here */
+  return index_insert(ix, parent, child);
+}
+
+static bool is_ignored_n(const char *name, size_t len) {
+  char tmp[64];
+  if (len >= sizeof(tmp)) return false; /* every ignored name is far shorter */
+  memcpy(tmp, name, len);
+  tmp[len] = '\0';
+  return is_ignored(tmp);
+}
+
+/* Sort every directory case-insensitively and reject case-insensitive duplicates. */
+static int sort_and_check(exfat_file_node_t *dir, char *err, size_t err_len) {
+  if (dir->child_count > 1) {
+    qsort(dir->children, dir->child_count, sizeof(exfat_file_node_t *), node_cmp);
+    for (size_t i = 1; i < dir->child_count; i++) {
+      if (!strcasecmp(dir->children[i - 1]->name, dir->children[i]->name)) {
+        snprintf(err, err_len, "Duplicate entry (case-insensitive) under exFAT: %s", dir->children[i]->rel_path);
+        return -1;
+      }
+    }
+  }
+  for (size_t i = 0; i < dir->child_count; i++) {
+    if (dir->children[i]->is_dir && sort_and_check(dir->children[i], err, err_len) != 0) return -1;
+  }
+  return 0;
+}
+
+static int build_tree_from_listing(const exfat_listing_entry_t *entries, size_t count,
+                                   exfat_file_node_t *root, char *err, size_t err_len) {
+  child_index_t ix = { NULL, 0, 0 };
+  int rc = -1;
+
+  for (size_t k = 0; k < count; k++) {
+    const exfat_listing_entry_t *en = &entries[k];
+    if (!en->path) {
+      snprintf(err, err_len, "Listing entry %zu has no path", k);
+      goto done;
+    }
+
+    /* Pass 1: count components, drop entries with an ignored component anywhere in the path. */
+    size_t ncomp = 0;
+    bool ignored = false;
+    const char *first = NULL;
+    for (const char *p = en->path; *p;) {
+      while (*p == '/') p++;
+      if (!*p) break;
+      const char *e = p;
+      while (*e && *e != '/') e++;
+      if (!first) first = p;
+      if (is_ignored_n(p, (size_t)(e - p))) ignored = true;
+      ncomp++;
+      p = e;
+    }
+    if (ignored) continue;
+    if (ncomp == 0) {
+      if (en->is_dir) continue; /* the root itself */
+      snprintf(err, err_len, "Listing entry %zu is a file with an empty path", k);
+      goto done;
+    }
+
+    /* Pass 2: walk/create the chain of directories. */
+    exfat_file_node_t *cur = root;
+    const char *p = first;
+    for (size_t ci = 0; ci < ncomp; ci++) {
+      while (*p == '/') p++;
+      const char *e = p;
+      while (*e && *e != '/') e++;
+      size_t len = (size_t)(e - p);
+      bool last = (ci + 1 == ncomp);
+      exfat_file_node_t *child = index_find(&ix, cur, p, len);
+
+      if (!last) {
+        if (!child) {
+          if (attach_child(&ix, cur, create_node(p, len, first, (size_t)(e - first), true, 0, 0, false)) != 0) {
+            snprintf(err, err_len, "Out of memory building exFAT tree");
+            goto done;
+          }
+          child = cur->children[cur->child_count - 1];
+        } else if (!child->is_dir) {
+          snprintf(err, err_len, "Listing conflict: '%s' is a file but also used as a directory", child->rel_path);
+          goto done;
+        }
+        cur = child;
+      } else if (child) {
+        if (en->is_dir && child->is_dir && !child->declared) {
+          child->declared = true; /* explicit entry for a dir that was synthesized from a child path */
+        } else {
+          snprintf(err, err_len, "Duplicate entry in listing: %s", child->rel_path);
+          goto done;
+        }
+      } else {
+        exfat_file_node_t *n = create_node(p, len, first, (size_t)(e - first), en->is_dir,
+                                           en->is_dir ? 0 : en->size, en->is_dir ? 0 : en->file_id, true);
+        if (attach_child(&ix, cur, n) != 0) {
+          snprintf(err, err_len, "Out of memory building exFAT tree");
+          goto done;
+        }
+      }
+      p = e;
+    }
+  }
+
+  if (sort_and_check(root, err, err_len) != 0) goto done;
+  rc = 0;
+done:
+  free(ix.slots);
+  return rc;
+}
+
+/* ---- Folder -> listing (the folder path is just one listing source) ------------------------- */
+
+typedef struct {
+  exfat_listing_entry_t *entries;
+  size_t count;
+  size_t cap;
+} folder_listing_t;
+
+static void folder_listing_free(folder_listing_t *fl) {
+  for (size_t i = 0; i < fl->count; i++) free((char *)fl->entries[i].path);
+  free(fl->entries);
+  fl->entries = NULL;
+  fl->count = fl->cap = 0;
+}
+
+static int folder_listing_push(folder_listing_t *fl, const char *rel, bool is_dir, uint64_t size) {
+  if (fl->count >= fl->cap) {
+    size_t new_cap = fl->cap ? fl->cap * 2 : 64;
+    exfat_listing_entry_t *arr = (exfat_listing_entry_t *)realloc(fl->entries, new_cap * sizeof(*arr));
+    if (!arr) return -1;
+    fl->entries = arr;
+    fl->cap = new_cap;
+  }
+  char *dup = strdup(rel);
+  if (!dup) return -1;
+  exfat_listing_entry_t *en = &fl->entries[fl->count];
+  en->path = dup;
+  en->size = size;
+  en->is_dir = is_dir;
+  en->file_id = fl->count; /* index into the listing; the folder read op maps it back to a path */
+  fl->count++;
+  return 0;
+}
+
+static int scan_directory(const char *abs_dir, const char *rel_dir, folder_listing_t *fl) {
   DIR *d = opendir(abs_dir);
   if (!d) return -1;
   struct dirent *ent;
@@ -184,11 +396,12 @@ static int scan_directory(const char *abs_dir, const char *rel_dir, exfat_file_n
 
     char sub_abs[4096];
     char sub_rel[4096];
-    snprintf(sub_abs, sizeof(sub_abs), "%s/%s", abs_dir, ent->d_name);
-    if (rel_dir && rel_dir[0]) {
-      snprintf(sub_rel, sizeof(sub_rel), "%s/%s", rel_dir, ent->d_name);
-    } else {
-      snprintf(sub_rel, sizeof(sub_rel), "%s", ent->d_name);
+    int n1 = snprintf(sub_abs, sizeof(sub_abs), "%s/%s", abs_dir, ent->d_name);
+    int n2 = (rel_dir && rel_dir[0]) ? snprintf(sub_rel, sizeof(sub_rel), "%s/%s", rel_dir, ent->d_name)
+                                     : snprintf(sub_rel, sizeof(sub_rel), "%s", ent->d_name);
+    if (n1 < 0 || n2 < 0 || (size_t)n1 >= sizeof(sub_abs) || (size_t)n2 >= sizeof(sub_rel)) {
+      closedir(d);
+      return -1;
     }
 
     /* Use lstat to avoid following recursive symlinks */
@@ -205,37 +418,48 @@ static int scan_directory(const char *abs_dir, const char *rel_dir, exfat_file_n
     bool is_dir = S_ISDIR(st.st_mode);
     uint64_t sz = is_dir ? 0 : (uint64_t)st.st_size;
 
-    exfat_file_node_t *child = create_node(ent->d_name, sub_rel, sub_abs, is_dir, sz);
-    if (!child) { closedir(d); return -1; }
-
-    if (parent->child_count >= parent->child_cap) {
-      size_t new_cap = parent->child_cap ? parent->child_cap * 2 : 16;
-      exfat_file_node_t **arr = (exfat_file_node_t **)realloc(parent->children, new_cap * sizeof(exfat_file_node_t *));
-      if (!arr) { free_exfat_tree(child); closedir(d); return -1; }
-      parent->children = arr;
-      parent->child_cap = new_cap;
-    }
-    parent->children[parent->child_count++] = child;
-
-    if (is_dir) {
-      if (scan_directory(sub_abs, sub_rel, child) != 0) {
-        closedir(d);
-        return -1;
-      }
+    if (folder_listing_push(fl, sub_rel, is_dir, sz) != 0) { closedir(d); return -1; }
+    if (is_dir && scan_directory(sub_abs, sub_rel, fl) != 0) {
+      closedir(d);
+      return -1;
     }
   }
 
   closedir(d);
-  if (parent->child_count > 1) {
-    qsort(parent->children, parent->child_count, sizeof(exfat_file_node_t *), node_cmp);
-    /* Detect case-insensitive duplicates */
-    for (size_t i = 1; i < parent->child_count; i++) {
-      if (!strcasecmp(parent->children[i - 1]->name, parent->children[i]->name)) {
-        return -1; /* Duplicate entry under exFAT */
-      }
-    }
-  }
   return 0;
+}
+
+/* Folder read op: keeps one fd open for the file currently being streamed (strict offset order). */
+typedef struct {
+  const char *root;
+  const folder_listing_t *fl;
+  int fd;
+  uint64_t cur_id;
+} folder_src_t;
+
+static int folder_read(void *ctx, uint64_t file_id, uint64_t offset, void *buf, size_t len) {
+  folder_src_t *fs = (folder_src_t *)ctx;
+  if (file_id >= fs->fl->count) return -1;
+  if (fs->fd < 0 || fs->cur_id != file_id) {
+    if (fs->fd >= 0) { close(fs->fd); fs->fd = -1; }
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%s/%s", fs->root, fs->fl->entries[file_id].path);
+    if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+    fs->fd = open(path, O_RDONLY);
+    if (fs->fd < 0) return -1;
+    fs->cur_id = file_id;
+  }
+  size_t got = 0;
+  while (got < len) {
+    ssize_t r = pread(fs->fd, (uint8_t *)buf + got, len - got, (off_t)(offset + got));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (r == 0) break; /* EOF: short read, the writer reports it */
+    got += (size_t)r;
+  }
+  return (int)got;
 }
 
 static uint32_t directory_entry_count(const exfat_file_node_t *node, bool is_root) {
@@ -386,57 +610,80 @@ static int write_directory_cluster(const sink_t *fout, const exfat_file_node_t *
   return wr;
 }
 
-static int write_tree_content(const sink_t *fout, const exfat_file_node_t *dir,
-                              convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
-                              void *user_data, uint64_t total_bytes, uint64_t *done_bytes,
-                              uint32_t bitmap_first, uint32_t cluster_count, uint32_t bitmap_clusters,
-                              uint8_t *copy_buf, size_t copy_buf_sz) {
+#define COPY_BUF_SIZE (256U * 1024U)
+
+typedef struct {
+  const sink_t *fout;
+  const exfat_src_ops_t *ops;
+  void *ops_ctx;
+  convert_progress_cb progress_cb;
+  convert_cancel_cb cancel_cb;
+  void *user_data;
+  uint64_t total_bytes;
+  uint64_t done_bytes;
+  uint32_t bitmap_first;
+  uint32_t cluster_count;
+  uint32_t bitmap_clusters;
+  uint8_t *copy_buf;
+  size_t copy_buf_sz;
+  char *err;
+  size_t err_len;
+} write_ctx_t;
+
+/* Stream one file's body in strict offset order, then zero-pad to the cluster boundary. */
+static int write_file_body(write_ctx_t *w, const exfat_file_node_t *c) {
+  if (!w->ops || !w->ops->read) {
+    snprintf(w->err, w->err_len, "No data source provided for file '%s'", c->rel_path);
+    return -1;
+  }
+  uint64_t off = 0;
+  while (off < c->size) {
+    if (w->cancel_cb && w->cancel_cb(w->user_data)) return -2;
+    uint64_t rem = c->size - off;
+    size_t chunk = (rem > w->copy_buf_sz) ? w->copy_buf_sz : (size_t)rem;
+    int got = w->ops->read(w->ops_ctx, c->file_id, off, w->copy_buf, chunk);
+    if (got < 0 || (size_t)got != chunk) {
+      snprintf(w->err, w->err_len, "Source read failed for '%s' at offset %llu (wanted %zu bytes, got %d)",
+               c->rel_path, (unsigned long long)off, chunk, got);
+      return -1;
+    }
+    if (emit(w->fout, w->copy_buf, chunk) != 0) return -1;
+    off += chunk;
+    w->done_bytes += chunk;
+    if (w->progress_cb) w->progress_cb(w->total_bytes, w->done_bytes, w->user_data);
+  }
+
+  uint64_t alloc_sz = (uint64_t)c->cluster_count * CLUSTER_SIZE;
+  if (alloc_sz > c->size) {
+    size_t pad = (size_t)(alloc_sz - c->size);
+    uint8_t zero_pad[4096] = {0};
+    while (pad > 0) {
+      size_t p = (pad > sizeof(zero_pad)) ? sizeof(zero_pad) : pad;
+      if (emit(w->fout, zero_pad, p) != 0) return -1;
+      pad -= p;
+    }
+  }
+  return 0;
+}
+
+static int write_tree_content(write_ctx_t *w, const exfat_file_node_t *dir) {
   /* Write children files, and recurse on subdirs */
   for (size_t i = 0; i < dir->child_count; i++) {
-    if (cancel_cb && cancel_cb(user_data)) return -2;
+    if (w->cancel_cb && w->cancel_cb(w->user_data)) return -2;
     exfat_file_node_t *c = dir->children[i];
 
     if (c->is_dir) {
-      if (write_directory_cluster(fout, c, false, bitmap_first, cluster_count, bitmap_clusters) != 0) {
+      if (write_directory_cluster(w->fout, c, false, w->bitmap_first, w->cluster_count, w->bitmap_clusters) != 0) {
         return -1;
       }
-      *done_bytes += (uint64_t)c->cluster_count * CLUSTER_SIZE;
-      if (progress_cb) progress_cb(total_bytes, *done_bytes, user_data);
+      w->done_bytes += (uint64_t)c->cluster_count * CLUSTER_SIZE;
+      if (w->progress_cb) w->progress_cb(w->total_bytes, w->done_bytes, w->user_data);
 
-      int ret = write_tree_content(fout, c, progress_cb, cancel_cb, user_data,
-                                  total_bytes, done_bytes, bitmap_first, cluster_count, bitmap_clusters,
-                                  copy_buf, copy_buf_sz);
+      int ret = write_tree_content(w, c);
       if (ret != 0) return ret;
-    } else {
-      /* Stream file body directly into output */
-      if (c->size > 0 && c->abs_path) {
-        FILE *fin = fopen(c->abs_path, "rb");
-        if (!fin) return -1;
-
-        uint64_t rem = c->size;
-        while (rem > 0) {
-          if (cancel_cb && cancel_cb(user_data)) { fclose(fin); return -2; }
-          size_t chunk = (rem > copy_buf_sz) ? copy_buf_sz : (size_t)rem;
-          if (fread(copy_buf, 1, chunk, fin) != chunk) { fclose(fin); return -1; }
-          if (emit(fout, copy_buf, chunk) != 0) { fclose(fin); return -1; }
-          rem -= chunk;
-          *done_bytes += chunk;
-          if (progress_cb) progress_cb(total_bytes, *done_bytes, user_data);
-        }
-        fclose(fin);
-
-        /* Pad file allocation to cluster boundary */
-        uint64_t alloc_sz = (uint64_t)c->cluster_count * CLUSTER_SIZE;
-        if (alloc_sz > c->size) {
-          size_t pad = (size_t)(alloc_sz - c->size);
-          uint8_t zero_pad[4096] = {0};
-          while (pad > 0) {
-            size_t p = (pad > sizeof(zero_pad)) ? sizeof(zero_pad) : pad;
-            if (emit(fout, zero_pad, p) != 0) return -1;
-            pad -= p;
-          }
-        }
-      }
+    } else if (c->size > 0) {
+      int ret = write_file_body(w, c);
+      if (ret != 0) return ret;
     }
   }
   return 0;
@@ -460,20 +707,24 @@ static void fat_walk_chains(uint8_t *fat, const exfat_file_node_t *n) {
   }
 }
 
-int convert_folder_to_exfat_stream(const char *source_dir, exfat_begin_fn begin_fn,
-                                   exfat_sink_fn sink_fn, void *sink_ctx,
-                                   convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
-                                   void *user_data, char *err_msg, size_t err_len) {
+int convert_listing_to_exfat_stream(const exfat_listing_entry_t *entries, size_t count,
+                                    const exfat_src_ops_t *ops, void *ops_ctx,
+                                    exfat_begin_fn begin_fn, exfat_sink_fn sink_fn, void *sink_ctx,
+                                    convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                    void *user_data, char *err_msg, size_t err_len) {
   sink_t sink = { sink_fn, sink_ctx };
   sink_t *fout = &sink;
-  exfat_file_node_t *root = create_node("", "", NULL, true, 0);
+  if (!entries && count) {
+    snprintf(err_msg, err_len, "Listing is NULL");
+    return -1;
+  }
+  exfat_file_node_t *root = create_node("", 0, "", 0, true, 0, 0, true);
   if (!root) {
     snprintf(err_msg, err_len, "Failed to allocate exFAT root node");
     return -1;
   }
 
-  if (scan_directory(source_dir, "", root) != 0) {
-    snprintf(err_msg, err_len, "Failed scanning source directory (symlink loop, duplicate, or unreadable file)");
+  if (build_tree_from_listing(entries, count, root, err_msg, err_len) != 0) {
     free_exfat_tree(root);
     return -1;
   }
@@ -636,7 +887,7 @@ int convert_folder_to_exfat_stream(const char *source_dir, exfat_begin_fn begin_
   }
 
   /* 6. Recursive Content & Files */
-  uint8_t *heap_copy_buf = (uint8_t *)malloc(CLUSTER_SIZE);
+  uint8_t *heap_copy_buf = (uint8_t *)malloc(COPY_BUF_SIZE);
   if (!heap_copy_buf) {
     snprintf(err_msg, err_len, "Out of memory for copy buffer");
     free_exfat_tree(root);
@@ -645,9 +896,25 @@ int convert_folder_to_exfat_stream(const char *source_dir, exfat_begin_fn begin_
 
   uint64_t done_bytes = (uint64_t)heap_offset * BYTES_PER_SECTOR +
                         (uint64_t)(bitmap_clusters + upcase_clusters + root->cluster_count) * CLUSTER_SIZE;
-  int res = write_tree_content(fout, root, progress_cb, cancel_cb, user_data,
-                               total_bytes, &done_bytes, BITMAP_FIRST_CLUSTER, cluster_count, bitmap_clusters,
-                               heap_copy_buf, CLUSTER_SIZE);
+  write_ctx_t wc;
+  memset(&wc, 0, sizeof(wc));
+  wc.fout = fout;
+  wc.ops = ops;
+  wc.ops_ctx = ops_ctx;
+  wc.progress_cb = progress_cb;
+  wc.cancel_cb = cancel_cb;
+  wc.user_data = user_data;
+  wc.total_bytes = total_bytes;
+  wc.done_bytes = done_bytes;
+  wc.bitmap_first = BITMAP_FIRST_CLUSTER;
+  wc.cluster_count = cluster_count;
+  wc.bitmap_clusters = bitmap_clusters;
+  wc.copy_buf = heap_copy_buf;
+  wc.copy_buf_sz = COPY_BUF_SIZE;
+  wc.err = err_msg;
+  wc.err_len = err_len;
+  if (err_len) err_msg[0] = 0;
+  int res = write_tree_content(&wc, root);
 
   free(heap_copy_buf);
   free_exfat_tree(root);
@@ -656,11 +923,30 @@ int convert_folder_to_exfat_stream(const char *source_dir, exfat_begin_fn begin_
     snprintf(err_msg, err_len, "Conversion cancelled by user");
     return -2;
   } else if (res != 0) {
-    snprintf(err_msg, err_len, "Failed writing exFAT tree stream: %s", strerror(errno));
+    if (!err_msg[0]) snprintf(err_msg, err_len, "Failed writing exFAT tree stream: %s", strerror(errno));
     return -1;
   }
 
   return 0;
+}
+
+int convert_folder_to_exfat_stream(const char *source_dir, exfat_begin_fn begin_fn,
+                                   exfat_sink_fn sink_fn, void *sink_ctx,
+                                   convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                                   void *user_data, char *err_msg, size_t err_len) {
+  folder_listing_t fl = { NULL, 0, 0 };
+  if (scan_directory(source_dir, "", &fl) != 0) {
+    snprintf(err_msg, err_len, "Failed scanning source directory (symlink loop, duplicate, or unreadable file)");
+    folder_listing_free(&fl);
+    return -1;
+  }
+  folder_src_t src = { source_dir, &fl, -1, 0 };
+  exfat_src_ops_t ops = { folder_read };
+  int ret = convert_listing_to_exfat_stream(fl.entries, fl.count, &ops, &src, begin_fn, sink_fn, sink_ctx,
+                                            progress_cb, cancel_cb, user_data, err_msg, err_len);
+  if (src.fd >= 0) close(src.fd);
+  folder_listing_free(&fl);
+  return ret;
 }
 
 typedef struct {
@@ -678,9 +964,14 @@ static int file_sink(const void *buf, size_t len, void *ctx) {
   return fwrite(buf, 1, len, c->f) == len ? 0 : -1;
 }
 
-int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
-                            convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
-                            void *user_data, char *err_msg, size_t err_len) {
+/* Runs a streaming conversion into a freshly created file; removes it on failure. */
+typedef int (*stream_run_fn)(void *run_ctx, exfat_begin_fn begin_fn, exfat_sink_fn sink_fn, void *sink_ctx,
+                             convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                             void *user_data, char *err_msg, size_t err_len);
+
+static int stream_to_file(const char *out_image_path, stream_run_fn run, void *run_ctx,
+                          convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                          void *user_data, char *err_msg, size_t err_len) {
   file_sink_ctx_t ctx;
   ctx.total = 0;
   ctx.f = fopen(out_image_path, "wb");
@@ -688,8 +979,7 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
     snprintf(err_msg, err_len, "Failed to create output file: %s", strerror(errno));
     return -1;
   }
-  int ret = convert_folder_to_exfat_stream(source_dir, file_begin, file_sink, &ctx, progress_cb, cancel_cb,
-                                           user_data, err_msg, err_len);
+  int ret = run(run_ctx, file_begin, file_sink, &ctx, progress_cb, cancel_cb, user_data, err_msg, err_len);
   if (ret != 0) {
     fclose(ctx.f);
     unlink(out_image_path);
@@ -702,4 +992,37 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   }
   if (progress_cb) progress_cb(ctx.total, ctx.total, user_data);
   return 0;
+}
+
+static int run_folder(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, void *sc,
+                      convert_progress_cb p, convert_cancel_cb c, void *u, char *e, size_t el) {
+  return convert_folder_to_exfat_stream((const char *)run_ctx, b, s, sc, p, c, u, e, el);
+}
+
+typedef struct {
+  const exfat_listing_entry_t *entries;
+  size_t count;
+  const exfat_src_ops_t *ops;
+  void *ops_ctx;
+} listing_run_t;
+
+static int run_listing(void *run_ctx, exfat_begin_fn b, exfat_sink_fn s, void *sc,
+                       convert_progress_cb p, convert_cancel_cb c, void *u, char *e, size_t el) {
+  const listing_run_t *lr = (const listing_run_t *)run_ctx;
+  return convert_listing_to_exfat_stream(lr->entries, lr->count, lr->ops, lr->ops_ctx, b, s, sc, p, c, u, e, el);
+}
+
+int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
+                            convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                            void *user_data, char *err_msg, size_t err_len) {
+  return stream_to_file(out_image_path, run_folder, (void *)source_dir, progress_cb, cancel_cb,
+                        user_data, err_msg, err_len);
+}
+
+int convert_listing_to_exfat(const exfat_listing_entry_t *entries, size_t count,
+                             const exfat_src_ops_t *ops, void *ops_ctx, const char *out_image_path,
+                             convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
+                             void *user_data, char *err_msg, size_t err_len) {
+  listing_run_t lr = { entries, count, ops, ops_ctx };
+  return stream_to_file(out_image_path, run_listing, &lr, progress_cb, cancel_cb, user_data, err_msg, err_len);
 }
