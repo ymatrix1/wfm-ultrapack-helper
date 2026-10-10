@@ -442,22 +442,30 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   }
 
   /* Write Main + Backup Boot Sector */
-  fwrite(boot_region, 1, sizeof(boot_region), fout);
-  fwrite(boot_region, 1, sizeof(boot_region), fout);
+  if (fwrite(boot_region, 1, sizeof(boot_region), fout) != sizeof(boot_region) ||
+      fwrite(boot_region, 1, sizeof(boot_region), fout) != sizeof(boot_region)) {
+    snprintf(err_msg, err_len, "Failed writing exFAT boot sectors");
+    fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+    return -1;
+  }
 
   /* Pad to FAT offset */
   size_t pad_to_fat = (FAT_OFFSET_SECTORS - 24) * BYTES_PER_SECTOR;
   uint8_t zero_buf[4096] = {0};
   while (pad_to_fat > 0) {
     size_t p = (pad_to_fat > sizeof(zero_buf)) ? sizeof(zero_buf) : pad_to_fat;
-    fwrite(zero_buf, 1, p, fout);
+    if (fwrite(zero_buf, 1, p, fout) != p) {
+      snprintf(err_msg, err_len, "Failed writing FAT padding");
+      fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+      return -1;
+    }
     pad_to_fat -= p;
   }
 
   /* 2. Write FAT */
   size_t fat_bytes = fat_len_sectors * BYTES_PER_SECTOR;
   uint8_t *fat = (uint8_t *)calloc(1, fat_bytes);
-  if (!fat) { fclose(fout); free_exfat_tree(root); return -1; }
+  if (!fat) { fclose(fout); free_exfat_tree(root); unlink(out_image_path); return -1; }
   put32_le(fat, FAT_ENTRY_MEDIA);
   put32_le(fat + 4, FAT_ENTRY_EOC);
 
@@ -465,33 +473,53 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   fat_chain(fat, BITMAP_FIRST_CLUSTER + bitmap_clusters, upcase_clusters);
   fat_walk_chains(fat, root);
 
-  fwrite(fat, 1, fat_bytes, fout);
+  if (fwrite(fat, 1, fat_bytes, fout) != fat_bytes) {
+    snprintf(err_msg, err_len, "Failed writing FAT table");
+    free(fat); fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+    return -1;
+  }
   free(fat);
 
   /* Pad to Heap Offset */
   size_t pad_to_heap = (heap_offset - (FAT_OFFSET_SECTORS + fat_len_sectors * NUMBER_OF_FATS)) * BYTES_PER_SECTOR;
   while (pad_to_heap > 0) {
     size_t p = (pad_to_heap > sizeof(zero_buf)) ? sizeof(zero_buf) : pad_to_heap;
-    fwrite(zero_buf, 1, p, fout);
+    if (fwrite(zero_buf, 1, p, fout) != p) {
+      snprintf(err_msg, err_len, "Failed writing heap padding");
+      fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+      return -1;
+    }
     pad_to_heap -= p;
   }
 
   /* 3. Cluster Heap: Allocation Bitmap */
   size_t bmap_bytes = align_up32(ceil_div32(cluster_count, 8), CLUSTER_SIZE);
   uint8_t *bitmap = (uint8_t *)calloc(1, bmap_bytes);
-  if (!bitmap) { fclose(fout); free_exfat_tree(root); return -1; }
+  if (!bitmap) { fclose(fout); free_exfat_tree(root); unlink(out_image_path); return -1; }
   for (uint32_t bit = 0; bit < cluster_count; bit++) {
     bitmap[bit / 8] |= (uint8_t)(1 << (bit % 8));
   }
-  fwrite(bitmap, 1, bmap_bytes, fout);
+  if (fwrite(bitmap, 1, bmap_bytes, fout) != bmap_bytes) {
+    snprintf(err_msg, err_len, "Failed writing bitmap");
+    free(bitmap); fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+    return -1;
+  }
   free(bitmap);
 
   /* 4. Up-case table */
   size_t upcase_pad = upcase_clusters * CLUSTER_SIZE - UPCASE_TABLE_LEN;
-  fwrite(UPCASE_TABLE, 1, UPCASE_TABLE_LEN, fout);
+  if (fwrite(UPCASE_TABLE, 1, UPCASE_TABLE_LEN, fout) != UPCASE_TABLE_LEN) {
+    snprintf(err_msg, err_len, "Failed writing upcase table");
+    fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+    return -1;
+  }
   while (upcase_pad > 0) {
     size_t p = (upcase_pad > sizeof(zero_buf)) ? sizeof(zero_buf) : upcase_pad;
-    fwrite(zero_buf, 1, p, fout);
+    if (fwrite(zero_buf, 1, p, fout) != p) {
+      snprintf(err_msg, err_len, "Failed writing upcase padding");
+      fclose(fout); free_exfat_tree(root); unlink(out_image_path);
+      return -1;
+    }
     upcase_pad -= p;
   }
 
@@ -499,6 +527,7 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   if (write_directory_cluster(fout, root, true, BITMAP_FIRST_CLUSTER, cluster_count, bitmap_clusters) != 0) {
     fclose(fout);
     free_exfat_tree(root);
+    unlink(out_image_path);
     return -1;
   }
 
@@ -508,15 +537,22 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   int res = write_tree_content(fout, root, progress_cb, cancel_cb, user_data,
                                total_bytes, &done_bytes, BITMAP_FIRST_CLUSTER, cluster_count, bitmap_clusters);
 
-  fclose(fout);
   free_exfat_tree(root);
 
   if (res == -2) {
     snprintf(err_msg, err_len, "Conversion cancelled by user");
+    fclose(fout);
     unlink(out_image_path);
     return -2;
   } else if (res != 0) {
     snprintf(err_msg, err_len, "Failed writing exFAT tree stream");
+    fclose(fout);
+    unlink(out_image_path);
+    return -1;
+  }
+
+  if (fclose(fout) != 0) {
+    snprintf(err_msg, err_len, "Failed flushing output exFAT image: %s", strerror(errno));
     unlink(out_image_path);
     return -1;
   }

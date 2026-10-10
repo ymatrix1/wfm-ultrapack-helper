@@ -111,6 +111,33 @@ static bool check_cancel(void *user_data) {
   return ctx->cancel_requested;
 }
 
+typedef struct worker_job {
+  client_context_t *ctx;
+  char source[2048];
+  char destination[2048];
+  char format[64];
+  uint64_t request_id;
+} worker_job_t;
+
+static void *conversion_worker_thread(void *arg) {
+  worker_job_t *job = (worker_job_t *)arg;
+  char err_msg[1024] = {0};
+
+  int ret = run_conversion(job->source, job->destination, job->format,
+                           on_convert_progress, check_cancel,
+                           job->ctx, err_msg, sizeof(err_msg));
+
+  if (ret == 0) {
+    send_frame(job->ctx->fd, WUP_MSG_DONE, job->request_id, NULL, 0);
+  } else {
+    const char *resp = err_msg[0] ? err_msg : "Conversion failed";
+    send_frame(job->ctx->fd, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
+  }
+
+  free(job);
+  return NULL;
+}
+
 static void *
 handle_client(void *arg) {
   int fd = (int)(intptr_t)arg;
@@ -122,6 +149,7 @@ handle_client(void *arg) {
   ctx.fd = fd;
   ctx.request_id = 0;
   ctx.cancel_requested = false;
+  pthread_t worker_tid = 0;
 
   while (g_running) {
     int ret = recv_frame(fd, &frame, payload, sizeof(payload));
@@ -134,34 +162,41 @@ handle_client(void *arg) {
     } else if (frame.type == WUP_MSG_CANCEL) {
       ctx.cancel_requested = true;
     } else if (frame.type == WUP_MSG_CONVERT) {
-      /* Conversion request handling: format is source\ndestination\nformat */
+      /* Reset cancellation for fresh job */
+      ctx.cancel_requested = false;
       send_frame(fd, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
-      char source[2048] = {0};
-      char destination[2048] = {0};
-      char format[64] = "ffpfsc";
+      worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
+      if (!job) {
+        const char *err = "Out of memory";
+        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        continue;
+      }
+
+      job->ctx = &ctx;
+      job->request_id = frame.request_id;
+      strncpy(job->format, "ffpfsc", sizeof(job->format) - 1);
 
       char *line1 = strtok(payload, "\n");
       char *line2 = strtok(NULL, "\n");
       char *line3 = strtok(NULL, "\n");
 
-      if (line1) strncpy(source, line1, sizeof(source) - 1);
-      if (line2) strncpy(destination, line2, sizeof(destination) - 1);
-      if (line3) strncpy(format, line3, sizeof(format) - 1);
+      if (line1) strncpy(job->source, line1, sizeof(job->source) - 1);
+      if (line2) strncpy(job->destination, line2, sizeof(job->destination) - 1);
+      if (line3) strncpy(job->format, line3, sizeof(job->format) - 1);
 
-      char err_msg[1024] = {0};
-      ret = run_conversion(source, destination, format, on_convert_progress, check_cancel,
-                           &ctx, err_msg, sizeof(err_msg));
-
-      if (ret == 0) {
-        send_frame(fd, WUP_MSG_DONE, frame.request_id, NULL, 0);
+      if (pthread_create(&worker_tid, NULL, conversion_worker_thread, job) != 0) {
+        free(job);
+        const char *err = "Failed to spawn conversion thread";
+        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
       } else {
-        const char *resp = err_msg[0] ? err_msg : "Conversion failed";
-        send_frame(fd, WUP_MSG_ERROR, frame.request_id, resp, (uint32_t)strlen(resp));
+        pthread_detach(worker_tid);
       }
     }
   }
 
+  /* Wait for or cancel any active worker */
+  ctx.cancel_requested = true;
   close(fd);
   return NULL;
 }

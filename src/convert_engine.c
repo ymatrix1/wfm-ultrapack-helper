@@ -151,18 +151,36 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   memcpy(hdr + 28, &data_off_ptr, 4);
   memcpy(hdr + 32, &logical_size, 8);
 
-  fseek(fout, 0, SEEK_SET);
-  fwrite(hdr, 1, sizeof(hdr), fout);
+  if (fseek(fout, 0, SEEK_SET) != 0 || fwrite(hdr, 1, sizeof(hdr), fout) != sizeof(hdr)) {
+    snprintf(err_msg, err_len, "Failed writing PFSC header");
+    free(offsets); fclose(fin); fclose(fout);
+    unlink(out_ffpfsc_path);
+    return -1;
+  }
 
   /* 3. Write Offset Table starting at 0x400 */
-  fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET);
+  if (fseek(fout, PFSC_BLOCK_OFFSETS_OFFSET, SEEK_SET) != 0) {
+    snprintf(err_msg, err_len, "Failed seeking to block offset table");
+    free(offsets); fclose(fin); fclose(fout);
+    unlink(out_ffpfsc_path);
+    return -1;
+  }
   for (uint32_t b = 0; b <= block_count; b++) {
-    fwrite(&offsets[b], sizeof(uint64_t), 1, fout);
+    if (fwrite(&offsets[b], sizeof(uint64_t), 1, fout) != 1) {
+      snprintf(err_msg, err_len, "Failed writing offset table");
+      free(offsets); fclose(fin); fclose(fout);
+      unlink(out_ffpfsc_path);
+      return -1;
+    }
   }
 
   free(offsets);
   fclose(fin);
-  fclose(fout);
+  if (fclose(fout) != 0) {
+    snprintf(err_msg, err_len, "Failed flushing output file: %s", strerror(errno));
+    unlink(out_ffpfsc_path);
+    return -1;
+  }
   return 0;
 }
 
