@@ -1,0 +1,377 @@
+[
+ {
+  "path": "eboot.bin",
+  "size": 557709,
+  "sha256": "2cd6065cb83b0d50e41217b79a2c92924891d6d4460d99d96e649c8db97fa948"
+ },
+ {
+  "path": "ItemzCore.self",
+  "size": 5805363,
+  "sha256": "537be68bddee3046a5708a085bafe8b9a996813269a094405b07b60a994ddedb"
+ },
+ {
+  "path": "sce_discmap.plt",
+  "size": 3288792,
+  "sha256": "1c1732ad77935b20a360bc6fba60a231519bb35468c1eb55192823e56e75bd14"
+ },
+ {
+  "path": "assets/app_home_host.png",
+  "size": 10672,
+  "sha256": "a12e3b569713da1fd3b5dd06b7c5a46595b74ad145ea1ea2c3c687a68ffc2042"
+ },
+ {
+  "path": "assets/backgroundUnitOffline.png",
+  "size": 481089,
+  "sha256": "80bc2f16788d6c2f8411f198762d277686aac72f83f63ee4af78f3d976671308"
+ },
+ {
+  "path": "assets/cover.png",
+  "size": 263254,
+  "sha256": "536c8dadb538efdf3a01b0c422d81412bf03efbf137f742ad5d82b310b5e30ce"
+ },
+ {
+  "path": "assets/daemon.elf",
+  "size": 631896,
+  "sha256": "d6a136d55dc0e7b114123fff0e52e47323cb949d2d15dffaa4ffdc97ab51ac31"
+ },
+ {
+  "path": "assets/debug_item_icon.png",
+  "size": 688,
+  "sha256": "adf89c6bd340bcc13e43ee7077b6f3f0f7bff5bd2f173283b562b69858d548cd"
+ },
+ {
+  "path": "assets/heart.png",
+  "size": 1373,
+  "sha256": "3b9e6db2956ed0c12ba1d521c581b4f8824fdf96ac2ae5891dc2fa2f1b069819"
+ },
+ {
+  "path": "assets/incomp.png",
+  "size": 8713,
+  "sha256": "9fc1967fa2350714326c76ddacff86aefc2d42704a48e4ad5301854d81252152"
+ },
+ {
+  "path": "assets/no_save.png",
+  "size": 512,
+  "sha256": "c691cc71ce6f42bdc77a54ad1ba0b50f76759e6a3f97f0492ba42c2f6aa115b6"
+ },
+ {
+  "path": "assets/ps4_cover_not_found.png",
+  "size": 226420,
+  "sha256": "068af416aae59ac2becfd81b312e6a636e3c04e84a3383bf595441cd56cde266"
+ },
+ {
+  "path": "assets/ps4_disc.png",
+  "size": 960255,
+  "sha256": "e85633c9b7dcf3d1e9809d0b64c78386123248e226684b84044f23164faeb599"
+ },
+ {
+  "path": "assets/PS5_Apps.db",
+  "size": 12288,
+  "sha256": "83d397358bfa526230256a5d26d8cdb4b558eda6fe22586f1e47d4d389a2e25d"
+ },
+ {
+  "path": "assets/ps5_cover.png",
+  "size": 177705,
+  "sha256": "8583197706a64768a55218c8ff141679585ac4e35df8390807cad938624be358"
+ },
+ {
+  "path": "assets/ps5_cover_not_found.png",
+  "size": 185896,
+  "sha256": "607c4b10c9bf85138613a027152964698723179a6a8522ef3c305b7223f21094"
+ },
+ {
+  "path": "assets/ps5_disc.png",
+  "size": 765871,
+  "sha256": "d46c3933c414de57f326fab0d737f3f655395f885cbcdc7d0c0528b31576a8fa"
+ },
+ {
+  "path": "assets/REPL93413.pkg",
+  "size": 1258500,
+  "sha256": "6da3614bf02f3210c47702397d9c37fa4d132c33762355b7590e9a6587ce5f15"
+ },
+ {
+  "path": "assets/workspace0.png",
+  "size": 13192,
+  "sha256": "2d8e85f2dfccc33ef84e907d2a793ac3d897d7b4f7ae83308dd84295ab8f07c4"
+ },
+ {
+  "path": "assets/buttons/btn_down.png",
+  "size": 654,
+  "sha256": "9952ede5c7bf38e4f930a611f216d1e3cb4ec5e47439216c9717a8f7ac7da025"
+ },
+ {
+  "path": "assets/buttons/btn_l1.png",
+  "size": 1552,
+  "sha256": "3896e83f82df693c4a3fa02181c74f6d6800a0b7c0e511a38cebddf8e072391e"
+ },
+ {
+  "path": "assets/buttons/btn_l2.png",
+  "size": 3627,
+  "sha256": "c91e1af0e0370ff7ff96350161e07a77d7a939150fed1f804a29fd5f7dc9589f"
+ },
+ {
+  "path": "assets/buttons/btn_left.png",
+  "size": 634,
+  "sha256": "5a85132b4feb64be85c921546d20c1a5394013875063a2a9e1fa80230224f608"
+ },
+ {
+  "path": "assets/buttons/btn_o.png",
+  "size": 6528,
+  "sha256": "176e80bc79d807c5fa8c8a75a654a620b1742298c53c180813dbec6079ff8d68"
+ },
+ {
+  "path": "assets/buttons/btn_options.png",
+  "size": 7210,
+  "sha256": "776ace4c0c5fbd8a22eb1456aed19c143f7bebf354f419b31f3c593c627d54b3"
+ },
+ {
+  "path": "assets/buttons/btn_r1.png",
+  "size": 4473,
+  "sha256": "7cd0e7a5c89f8d11f672be06b93efc4098b00d10f3fccb87d5bed5c64a5fb8d8"
+ },
+ {
+  "path": "assets/buttons/btn_right.png",
+  "size": 639,
+  "sha256": "893c9bcd97a6ab5f44aa982e35cef49db1ae442ec3c7cfee088f3495c801dc60"
+ },
+ {
+  "path": "assets/buttons/btn_sq.png",
+  "size": 5655,
+  "sha256": "14ebd09990410b085a4eefd9c1872313d1398a24df6a7900087e891baf5f421d"
+ },
+ {
+  "path": "assets/buttons/btn_tri.png",
+  "size": 6101,
+  "sha256": "41f7026e0ab795293930fe44b0bd938e333f42921c6409c8eda4a73118a782ac"
+ },
+ {
+  "path": "assets/buttons/btn_up.png",
+  "size": 641,
+  "sha256": "bb0bf48a87ab6052db02065882ff00e771ec76f1093114d1feef4dc40abb791e"
+ },
+ {
+  "path": "assets/buttons/btn_x.png",
+  "size": 6261,
+  "sha256": "ba690086c950a3705796f998e04671d29370f180a15127290a5393a1d1b0f045"
+ },
+ {
+  "path": "assets/fonts/font.ttf",
+  "size": 352736,
+  "sha256": "8316b1b5c1e47aad6220e10c83537cd32704e99e7885aabf56a1d897b3d3f1ee"
+ },
+ {
+  "path": "assets/fonts/HelveticaWorld-Multi.ttf",
+  "size": 656824,
+  "sha256": "9c0cecfb7b7335a89a898d9de689cbc55920d5a06223db501bb1bde2d812745e"
+ },
+ {
+  "path": "assets/fonts/NotoSansJP-Regular.ttf",
+  "size": 5672380,
+  "sha256": "c1b4f2babd7b9b7be2244fae0e58f409e1d1e0e7238cb56051927da2a2669b76"
+ },
+ {
+  "path": "assets/fonts/NotoSansKR-Regular.ttf",
+  "size": 5915196,
+  "sha256": "070ac5659664a87d04b87d6ad0467ac043682802ea0cfd2023e952480f2dae29"
+ },
+ {
+  "path": "assets/fonts/NotoSansSC-Regular.ttf",
+  "size": 10277652,
+  "sha256": "3aafd20325b7fab5e1168912b5754688852a9d4b1e8999485b913f4cad33a5be"
+ },
+ {
+  "path": "assets/fonts/NotoSansTC-Regular.ttf",
+  "size": 6956548,
+  "sha256": "ec8b2988d6cebbb985655b89f44eefa9750b9fd0b5e98c20d83625421dbe0dfb"
+ },
+ {
+  "path": "assets/fonts/NotoSansThai-Regular.ttf",
+  "size": 37652,
+  "sha256": "4a5d3b73083174706ed35d9310b93da9b217880ddcd80abc8c7d528dd807851a"
+ },
+ {
+  "path": "assets/notis/error.png",
+  "size": 12790,
+  "sha256": "e4775f77f0df7c1164685bafbf31cce4ff63fee4bc6e5e9dd1d50381ec9d3aac"
+ },
+ {
+  "path": "assets/notis/game.png",
+  "size": 3107,
+  "sha256": "71ad8da74004f93d116d37c5b8ef6b42023a7b8d093771fdbea5ca24fd836d4d"
+ },
+ {
+  "path": "assets/notis/game_usb.png",
+  "size": 1991,
+  "sha256": "329b102b0daf12a949f7bb7e5f9e78593d5f32c209d6cb29e88716dbd0d4eff2"
+ },
+ {
+  "path": "assets/notis/info.png",
+  "size": 4122,
+  "sha256": "a247f603d089ea353d3c9309dc14ac2040e8700e57b5592d24736a7da5789279"
+ },
+ {
+  "path": "assets/notis/kofi.png",
+  "size": 10535,
+  "sha256": "48d92d3bc7c999befb75e27152c96f8495bb4184e7a8286e3fd63d75250073b7"
+ },
+ {
+  "path": "assets/notis/profile.png",
+  "size": 9427,
+  "sha256": "c80182458ad03770762d77b625134b8f6eb63b1c4bf480b24a2c65c5817df752"
+ },
+ {
+  "path": "assets/notis/success.png",
+  "size": 352,
+  "sha256": "0ada906ee83a736d873ce263dc029ab0db8f712472f1c532992f4ae4527545d5"
+ },
+ {
+  "path": "assets/notis/warning.png",
+  "size": 2333,
+  "sha256": "879eea02b07edb1ebc36d9342080e3156d6aa1a2269a0ecfb94e80bb2ae08155"
+ },
+ {
+  "path": "assets/old_discs/ps4_disc.png",
+  "size": 472402,
+  "sha256": "68f47f169ab14d971a5bfb83bbc5f8188fce66ac16e7c89be49cc79b61792243"
+ },
+ {
+  "path": "assets/old_discs/ps5_disc.png",
+  "size": 230150,
+  "sha256": "3c89b1d746945b33465ddef659ec81ed4fc9d852ace038899d7ed299965ee3a7"
+ },
+ {
+  "path": "assets/plugins/itemzflow_xml_patches.plugin",
+  "size": 738021,
+  "sha256": "096400b48818357191066f642c3d6cc0e8aadaf7d0e9038849f09ac0c2da8048"
+ },
+ {
+  "path": "assets/shortcut_icons/browser_icon0.png",
+  "size": 28614,
+  "sha256": "a49ccbf0bb9b5e1b29602181111c0f9029b95af571ca9cc9d857489cfce0b6c6"
+ },
+ {
+  "path": "assets/shortcut_icons/etaHEN_icon0.png",
+  "size": 211606,
+  "sha256": "67ae946b4d60e7b9ce9b6883357571834d423f1ee877a9dc328a0dd984c9b05c"
+ },
+ {
+  "path": "assets/shortcut_icons/webman_icon0.png",
+  "size": 47143,
+  "sha256": "c93238d2656828493f1f8bd57965e67a450cc2a56a215320b1e147dee5970206"
+ },
+ {
+  "path": "daemon/daemon.debug_info",
+  "size": 1804912,
+  "sha256": "a68770dc8e4e48ee08a1fe9b0da05cf39298ea5c5aed42c7bb8e8ca7a079a870"
+ },
+ {
+  "path": "daemon/daemon.self",
+  "size": 1804912,
+  "sha256": "a5737fa60938733f3d67e59b0eae44c32144f7f89cb99d7f585d9f9e9c925015"
+ },
+ {
+  "path": "dumper/eboot.bin",
+  "size": 1480064,
+  "sha256": "75c4a6803452c48d50e8ba83e91eda857a4277ce8022a1f3e0e93969549cd765"
+ },
+ {
+  "path": "dumper/libc.prx",
+  "size": 1284418,
+  "sha256": "fd7f8a725f33174950792b828048dd4b6d9970517df656f912f6226ee290c1aa"
+ },
+ {
+  "path": "langs/0/lang.ini",
+  "size": 28718,
+  "sha256": "b6c92cfe971105c510f38b2d0378bb440b541c0f31168471e8e21b9efe7b2a76"
+ },
+ {
+  "path": "langs/1/lang.ini",
+  "size": 20722,
+  "sha256": "85d0acb2c47ba41b8dc76cf4869df760a0559de55c4f1d4fb47236dc21f12f18"
+ },
+ {
+  "path": "langs/10/lang.ini",
+  "size": 20104,
+  "sha256": "2ae1e3e55ce6b4c452e2b287430305b63e1ec33b3b63d890f74c7477cdd396b5"
+ },
+ {
+  "path": "langs/11/lang.ini",
+  "size": 20103,
+  "sha256": "82c3861c3877adc071b4d3aefafe73fc832ac97593dc8139790ae7c3e88b7b7c"
+ },
+ {
+  "path": "langs/19/lang.ini",
+  "size": 22945,
+  "sha256": "5b628660c8b012d598b3acc664a0900309f3476f4cc3a781e2a845d31c7eb46e"
+ },
+ {
+  "path": "langs/25/lang.ini",
+  "size": 36674,
+  "sha256": "0d6a05e5c29b36af7e30912ada15dab0aa5fddf2587105da583cb91c40ef0307"
+ },
+ {
+  "path": "langs/27/lang.ini",
+  "size": 41281,
+  "sha256": "3d030dcf21bfae1d1c0b49fe93a7752ed89f71d5fe14714b0a8b2db02c902c19"
+ },
+ {
+  "path": "langs/3/lang.ini",
+  "size": 45522,
+  "sha256": "fe5f94fbd6d3fd787d0835db28d0a5b965d39637fef2e75393831358653b4dfb"
+ },
+ {
+  "path": "langs/5/lang.ini",
+  "size": 23004,
+  "sha256": "a1b925fd963de9ef0a66cd6f92a770e996f7403f4f2f301135f00999689b4049"
+ },
+ {
+  "path": "Media/curl.prx",
+  "size": 1381040,
+  "sha256": "91fd2e8c5dbce6cd85bcd3860697dab030022315760af077d23286a497e5e6f8"
+ },
+ {
+  "path": "Media/piglet.prx",
+  "size": 616775,
+  "sha256": "c75e1a779ba372d0649ee661648c16282b6e212b8d12af4cae70437412d3be73"
+ },
+ {
+  "path": "sce_module/libc.prx",
+  "size": 1328754,
+  "sha256": "06a1ab248533498a444e10871e513214bc3f7bf37189e72593a4633a63dec1de"
+ },
+ {
+  "path": "sce_module/libSceFios2.prx",
+  "size": 457073,
+  "sha256": "4f1901ad9f68bd5b9783d047796a6d60a1e28bc01f31f6f87bd8a2a31bfbe703"
+ },
+ {
+  "path": "sce_sys/keystone",
+  "size": 96,
+  "sha256": "d09eb8ab5f3b700164fc8ad85c54c2acbad71244e942aeedf7e3e7eb56408aac"
+ },
+ {
+  "path": "sce_sys/param.sfo",
+  "size": 1868,
+  "sha256": "83d2e840e904f64c84c91b5e2214d7cab6f1f4e7cc3def63b27a2f69cc0631d1"
+ },
+ {
+  "path": "sce_sys/playgo-chunk.dat",
+  "size": 416,
+  "sha256": "c4bc1a3be25b342595d81dbc7a4df28bded31c649996929e9a37e9ab612d2fb6"
+ },
+ {
+  "path": "sce_sys/playgo-chunk.sha",
+  "size": 3836,
+  "sha256": "8558dc5bdf0f6ddc93fb57926971b29f0e9f5e01c2433658c9570e1347f7bf44"
+ },
+ {
+  "path": "sce_sys/playgo-manifest.xml",
+  "size": 368,
+  "sha256": "b4d0036b544a66edc732cbd2e034cf5f5b1f46b5817209d333b33e5efc016b11"
+ },
+ {
+  "path": "sce_sys/icon0.png",
+  "size": 186573,
+  "sha256": "cb369a3037658ad3806f031a42aaf90712d9a5585d14e4c32fd846db5f1c615c"
+ }
+]

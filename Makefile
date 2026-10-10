@@ -1,7 +1,7 @@
 BIN := wfm-ultrapack-helper.elf
 LINUX_BIN := wfm-ultrapack-helper-linux
 
-SRCS := src/main.c src/exfat_engine.c src/convert_engine.c src/miniz.c src/crypto.c src/rsa.c
+SRCS := src/main.c src/exfat_engine.c src/convert_engine.c src/miniz.c src/crypto.c src/rsa.c src/pkg_reader.c
 OBJS := $(SRCS:.c=.o)
 LINUX_OBJS := $(SRCS:.c=.linux.o)
 

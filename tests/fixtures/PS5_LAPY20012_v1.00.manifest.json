@@ -1,0 +1,357 @@
+[
+ {
+  "path": "archive.psarc",
+  "size": 399393,
+  "sha256": "028a1c546d5ff540046436bb7e593781195d6c04cbaacbcc2f6c4cf89eb09584"
+ },
+ {
+  "path": "archive.txt",
+  "size": 120,
+  "sha256": "65d37d66defac142efd2d07a85bd0270184c8dcb3e0d59077c8e88fc29653a9c"
+ },
+ {
+  "path": "eboot.bin",
+  "size": 23070574,
+  "sha256": "5090e7d0fd53c9707977c0bd19add6f5a30475bb23b3022ec6566a92b939ab7a"
+ },
+ {
+  "path": "sce_discmap.plt",
+  "size": 3288792,
+  "sha256": "78b56f7737a4230ece08a8eaabcfda741d85127eef712bf9c69ba11f70ef04dd"
+ },
+ {
+  "path": "Media/boot.config",
+  "size": 0,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ {
+  "path": "Media/globalgamemanagers",
+  "size": 25616,
+  "sha256": "0e0aab0c8dbd6eaf9a8e46a4592dcb4c0319b5d813ee998a206e32cef16f2b5c"
+ },
+ {
+  "path": "Media/globalgamemanagers.assets",
+  "size": 24068,
+  "sha256": "e63397171856f821b921ca4d4695047316ebe75e14bf7f0bb81f9e23123b7e19"
+ },
+ {
+  "path": "Media/methods_pointedto_by_uievents.xml",
+  "size": 162,
+  "sha256": "de6ab3df64b469adbfbd06b81c50a87e8006c0e1b918430ada7bc2e12ce8ee34"
+ },
+ {
+  "path": "Media/preserved_derived_types.xml",
+  "size": 2945,
+  "sha256": "9e02e135ccbbeb4945efba454bd47866b4e49bb923274e905b4bb2f50ff64a09"
+ },
+ {
+  "path": "Media/sharedassets0.assets.resS",
+  "size": 96520,
+  "sha256": "a480fc89e067ef75cd43250fb4ab7176afcba7de67beaff7ea9e153e585f02e4"
+ },
+ {
+  "path": "Media/UnityEngine.xml",
+  "size": 70,
+  "sha256": "956a33ad3d17c5e2572567830e9a725e682500c08e6a2b44b23cf6f62d33efb0"
+ },
+ {
+  "path": "Media/Managed/Assembly-CSharp.dll",
+  "size": 7168,
+  "sha256": "c4867ef902850d04b5b1ebb2575b932b8a0f3fd2f385c6e081b73ece72d51da9"
+ },
+ {
+  "path": "Media/Managed/ICallSummary.txt",
+  "size": 18142,
+  "sha256": "b3e89c4ff17c12c2668fa7d94a78b0ef45993e037e0e13cae14c0508ed922591"
+ },
+ {
+  "path": "Media/Managed/Mono.Security.dll",
+  "size": 153600,
+  "sha256": "7114a6a373e660046c5413959b22aeaa71ed8f700084c872fd783086f2a1a7e9"
+ },
+ {
+  "path": "Media/Managed/mscorlib.dll",
+  "size": 1797632,
+  "sha256": "537500e97a4b76accb50e74e5fe84b3abba4c631df5c1fc9bcc7213d60d398e6"
+ },
+ {
+  "path": "Media/Managed/SweepReport.log",
+  "size": 992300,
+  "sha256": "932b7c1e42cbbda2d0dd13b19bb0339d6ed7c70603cb4ad7369d82e848f6f50d"
+ },
+ {
+  "path": "Media/Managed/System.Configuration.dll",
+  "size": 62976,
+  "sha256": "98922694565129c41a8c9bc38203c2c321cf156a3f1f9354d84e0f341f0585d8"
+ },
+ {
+  "path": "Media/Managed/System.Core.dll",
+  "size": 40448,
+  "sha256": "adffb37ec03ba8270db72b984b9483722408cdcc82763c1cc0708818dddaa1a2"
+ },
+ {
+  "path": "Media/Managed/System.dll",
+  "size": 470528,
+  "sha256": "1ca82fe1e4c29fbab0d50150520738a3e0eceb137d88d5efbc8e493b7f585d82"
+ },
+ {
+  "path": "Media/Managed/System.Xml.dll",
+  "size": 460288,
+  "sha256": "4215f46e6fbf34e2541fffd5c8bb2263d9ac0131955030cb0359ea657bf4bc11"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.AIModule.dll",
+  "size": 6656,
+  "sha256": "965afb422335b9a0db9e8ba99273d7dee50e5e500dec14ddb0745365eff10278"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.AnimationModule.dll",
+  "size": 10752,
+  "sha256": "707dc0afd223b8c152788031bb38f53e53976c9d6ccb24f8a6a7257de80765f2"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.AudioModule.dll",
+  "size": 15360,
+  "sha256": "9a2cd9f3f0cb7d0423bc9c9dc21ea8e9bcac7a4bf9493dad04531c7afdc380e3"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.CoreModule.dll",
+  "size": 122368,
+  "sha256": "5944972706cca899568eab5911317fe288bc09115842b855d3398c5f6c01704a"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.DirectorModule.dll",
+  "size": 6144,
+  "sha256": "0d01f9c6e35730f18d6f62e554adcfc6fbd2e33987cbcde2025cf0e5303bdd1f"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.dll",
+  "size": 15360,
+  "sha256": "fd24a8e927a6ed4aae466b0db7eeebd746d861f3429fe44dd3f21e6fbe5242e8"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.IMGUIModule.dll",
+  "size": 32256,
+  "sha256": "a3d8c9421b3470d17f50c115b2b6a7c55f63e78dce104718bbb456c15aefdfce"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.InputModule.dll",
+  "size": 7680,
+  "sha256": "57cb65f7b021ebbc2893f697c5f83f00f089daaf65b571e8fa3bb1c386e0ca84"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.Physics2DModule.dll",
+  "size": 10240,
+  "sha256": "de58486549d85b2bf45602b1e6adfe88dc040fff77a32dccdbef3bb7e4af18c3"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.PhysicsModule.dll",
+  "size": 10752,
+  "sha256": "0baaf50bd214e96f60953e5f56cab94f603b943fca8fb86efce22011d2cc3585"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.TerrainModule.dll",
+  "size": 7680,
+  "sha256": "7b921adc35022de1e5341d18dddaf042e7f976ed4e4665c57b1280d819892156"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.TextRenderingModule.dll",
+  "size": 15360,
+  "sha256": "295beaddb2e5c95db5bd7a421bd9e2e8113fe411f70475a9a14386a000648083"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.TilemapModule.dll",
+  "size": 7168,
+  "sha256": "b48bbdf8a277685973e380b51387f3c896af397bd279fe6a3b6486cd56dcb031"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.UI.dll",
+  "size": 248832,
+  "sha256": "1d9d87a174171339940b1d4dd36da9e9798c99667ad530ee8ec95ee2cde07ddd"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.UIModule.dll",
+  "size": 14336,
+  "sha256": "261425db7d1d1b9cdbfbc9f4c1f12ca7bd6caf8370f6c73878699309b1328daa"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.UnityWebRequestAudioModule.dll",
+  "size": 6656,
+  "sha256": "27a943576d711f047061eb9f8e1a95db7b42aef3edc838b3f4198cddc1b0533d"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.UnityWebRequestModule.dll",
+  "size": 7168,
+  "sha256": "b485af6f2dbff0c320d43e3756eceb8e0ee861c68fe1bfd0badb233d2aca86d7"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.UnityWebRequestTextureModule.dll",
+  "size": 6656,
+  "sha256": "680853c1630b403627483e5469d6be367344633cbb7f0396d6626cc773ff7f24"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.VideoModule.dll",
+  "size": 8192,
+  "sha256": "0e555e4be3bb6a055e374262b1b45ce40234dfc746d39ba10ba16df97f4b33d5"
+ },
+ {
+  "path": "Media/Managed/UnityEngine.VRModule.dll",
+  "size": 12800,
+  "sha256": "4af6f32a8ea0e7966c135ca3d7f8f16855c82248a478bcb7c89a7ebf0b298dee"
+ },
+ {
+  "path": "Media/Managed/mono/2.0/machine.config",
+  "size": 28085,
+  "sha256": "4908e20272cbba16a094d87f86f77627ed3aad708dc3e45aa2c31b44bb3fb52a"
+ },
+ {
+  "path": "Media/Modules/MonoAssembliesPS4.prx",
+  "size": 7359029,
+  "sha256": "525bd5ca022193f0bd1e9cabb5dc71186f26c6b864527980d6f3b80b6272f662"
+ },
+ {
+  "path": "Media/Modules/mono-ps4.prx",
+  "size": 2337348,
+  "sha256": "f0113a6671577e5675ebce96ba11cb47aa25a7bbf838858156dd06766a320817"
+ },
+ {
+  "path": "Media/Plugins/universalps5.prx",
+  "size": 91773,
+  "sha256": "91efc20e2a29cb8ae1276f520b9dff0524f031b799667dadf73fba143359fdfe"
+ },
+ {
+  "path": "sce_module/libc.prx",
+  "size": 1069730,
+  "sha256": "e199f02a998661667ef06108369e55a363be437b6ec12bd0ca1a511f054444df"
+ },
+ {
+  "path": "sce_module/libSceAudioLatencyEstimation.prx",
+  "size": 19946,
+  "sha256": "fcff3aeb69c1d3eb921e9f224eaaf8bb016dcc2ba0267ec860a59e2b67fe78a1"
+ },
+ {
+  "path": "sce_module/libSceFace.prx",
+  "size": 297200,
+  "sha256": "0786c694d634d0daffc4b7edf47c0799a5fcee3f0601e3bbaacc1e4ea6039eec"
+ },
+ {
+  "path": "sce_module/libSceFaceTracker.prx",
+  "size": 2608311,
+  "sha256": "0f1afa63fbcf1ce7e0865b19bbf5773c1a834522ea129a6f5eb0d8e94c4aba13"
+ },
+ {
+  "path": "sce_module/libSceFios2.prx",
+  "size": 446777,
+  "sha256": "a6dba464b6220f1e71f7d04e2e3c9943486b9d6b7f88a7b9c15346df459c7fc2"
+ },
+ {
+  "path": "sce_module/libSceHand.prx",
+  "size": 24872,
+  "sha256": "83c86205da71deca4183d0a47387a4ff14e1ef2cacb04aaa5c0a8ddcb28a8ce6"
+ },
+ {
+  "path": "sce_module/libSceHandTracker.prx",
+  "size": 53199,
+  "sha256": "98496ef037a5d9aed3961061a825a92b7347f71466bc93e45bb4ec1f3ebd0092"
+ },
+ {
+  "path": "sce_module/libSceHeadTracker.prx",
+  "size": 1341983,
+  "sha256": "d3f8952ef04fdf93c79409e2c2509837e43276fe0fc02f1b2fa8a6f66e4d58c4"
+ },
+ {
+  "path": "sce_module/libSceJobManager.prx",
+  "size": 59166,
+  "sha256": "4af12f05c17a582cb63895a8e4fe483e8d37e6724cc6bdaf045337ed485465ea"
+ },
+ {
+  "path": "sce_module/libSceNpToolkit2.prx",
+  "size": 691694,
+  "sha256": "85237181d1c0607fb64367204046d3409e6d1d8a981225eb6fdf7a52009854fa"
+ },
+ {
+  "path": "sce_module/libSceS3DConversion.prx",
+  "size": 371593,
+  "sha256": "b340a1fe2f9b2841a3e4e97fd4f93e3bf543749b19ed3625debebdfedcab7526"
+ },
+ {
+  "path": "sce_module/libSceSmart.prx",
+  "size": 1425433,
+  "sha256": "ec66515e8b59e77e79cf6ef1a1d9c5879233cc4ce5e77ae90ea31e946d357fe5"
+ },
+ {
+  "path": "sce_sys/keystone",
+  "size": 96,
+  "sha256": "d09eb8ab5f3b700164fc8ad85c54c2acbad71244e942aeedf7e3e7eb56408aac"
+ },
+ {
+  "path": "sce_sys/about/right.sprx",
+  "size": 16025,
+  "sha256": "7ac46af09bedc1ff31a51977e52c959080e1213cede37d9794315a3986c72de7"
+ },
+ {
+  "path": "sce_sys/param.sfo",
+  "size": 1832,
+  "sha256": "12842469a373ea688788c491c63f563d0bda8b7df5e62b7aee21900e100a2d77"
+ },
+ {
+  "path": "sce_sys/playgo-chunk.dat",
+  "size": 416,
+  "sha256": "d2d500672c9885f350eb041498a31967b26d543ca3071987a688d68fe6a1d821"
+ },
+ {
+  "path": "sce_sys/playgo-chunk.sha",
+  "size": 3440,
+  "sha256": "0534b13f33e0df8aad3a8a8c069c4b474b903c1d2c87a1eaab988d72f2281869"
+ },
+ {
+  "path": "sce_sys/playgo-manifest.xml",
+  "size": 368,
+  "sha256": "b4d0036b544a66edc732cbd2e034cf5f5b1f46b5817209d333b33e5efc016b11"
+ },
+ {
+  "path": "sce_sys/pronunciation.xml",
+  "size": 262,
+  "sha256": "584e1b0e577e8fa8bfab168509721e0ca0ea7818526b12ebc1392dca8fffb3f2"
+ },
+ {
+  "path": "sce_sys/pronunciation.sig",
+  "size": 20,
+  "sha256": "b56233cb7d6c33173c7a635ab67a5f63af78b4c6dd899d8530599cc624e7df71"
+ },
+ {
+  "path": "sce_sys/pic1.png",
+  "size": 61877,
+  "sha256": "585f0d35f583ae44b01138115e7a5a7bd9113e262a7ca9e01f2b5d8ed20f3348"
+ },
+ {
+  "path": "sce_sys/shareparam.json",
+  "size": 122,
+  "sha256": "10034b4d17f0388a44aa0b99ead3cbde62760ed564b784040c6d7f07636d11cd"
+ },
+ {
+  "path": "sce_sys/icon0.png",
+  "size": 27039,
+  "sha256": "878392976aeab1f9c7de2f164e35deb656bfadd7c9a82ff3cd08c2d0625633f2"
+ },
+ {
+  "path": "sce_sys/pic0.png",
+  "size": 61877,
+  "sha256": "585f0d35f583ae44b01138115e7a5a7bd9113e262a7ca9e01f2b5d8ed20f3348"
+ },
+ {
+  "path": "sce_sys/icon0.dds",
+  "size": 131200,
+  "sha256": "4290c2bd97c4f9e76f14007a2d0b822cf464dbaac3aca616f707502584431161"
+ },
+ {
+  "path": "sce_sys/pic0.dds",
+  "size": 1036928,
+  "sha256": "fc837e2111fcc495521d9a1ad2441445386c0ee5087bc72b63f9bc5119235340"
+ },
+ {
+  "path": "sce_sys/pic1.dds",
+  "size": 1036928,
+  "sha256": "fc837e2111fcc495521d9a1ad2441445386c0ee5087bc72b63f9bc5119235340"
+ }
+]
