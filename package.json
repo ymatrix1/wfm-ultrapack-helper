@@ -5,7 +5,7 @@
   "main": "tests/protocol-test.js",
   "scripts": {
     "pretest": "node -e \"if (process.platform === 'linux') require('child_process').execSync('make linux', {stdio: 'inherit'})\"",
-    "test": "node tests/protocol-test.js && node tests/e2e-test.js"
+    "test": "node tests/protocol-test.js && node tests/e2e-test.js && node tests/shadowmount-compat-test.js && node tests/mt-test.js && node tests/crypto-test.js && node tests/rsa-test.js && node tests/listing-test.js && node tests/pkg-test.js && node tests/fih-test.js"
   },
   "keywords": [
     "ps5",

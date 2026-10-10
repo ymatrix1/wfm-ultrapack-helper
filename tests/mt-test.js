@@ -1,0 +1,354 @@
+// Multithreaded PFSC compressor tests: output must be byte-identical for every WUP_THREADS value,
+// cancel must stop and join all workers, and 8 threads must be clearly faster than 1.
+// Requires: `make linux` first. Set MT_SPEED_MB to change the speed-test size (default 600).
+const assert = require('assert');
+const net = require('net');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+const { parseFfpfsc } = require('./ffpfsc-util');
+
+if (process.platform !== 'linux') {
+  console.log('mt tests require Linux (AF_UNIX path socket); skipping.');
+  process.exit(0);
+}
+
+const ROOT = path.resolve(__dirname, '..');
+const BIN = path.join(ROOT, 'wfm-ultrapack-helper-linux');
+const SOCK = process.env.WUP_SOCKET || '/tmp/wfm-ultrapack-helper.sock';
+// Sanitizer builds distort timing: keep correctness checks, skip the speedup floor.
+const SANITIZED = /sanitize/.test(process.env.EXTRA_CFLAGS || '');
+process.env.WUP_FIXED_TIME = '1700000000'; // PFS timestamps are time-based: pin them so sha256 identity holds
+const HEADER = 20;
+const T = { PING: 1, PONG: 2, CONVERT: 10, CANCEL: 11, PROGRESS: 21, ACCEPTED: 20, DONE: 24, ERROR: 25 };
+const MB = 1024 * 1024;
+
+const frame = (type, rid, payload = Buffer.alloc(0)) => {
+  const b = Buffer.alloc(HEADER + payload.length);
+  b.write('WUPH', 0, 'ascii');
+  b.writeUInt16BE(type, 4);
+  b.writeUInt32BE(payload.length, 8);
+  b.writeBigUInt64BE(BigInt(rid), 12);
+  payload.copy(b, HEADER);
+  return b;
+};
+
+class Client {
+  constructor() {
+    this.buf = Buffer.alloc(0);
+    this.frames = [];
+    this.closed = false;
+    this.waiters = [];
+    this.sock = net.createConnection(SOCK);
+    this.sock.on('data', d => {
+      this.buf = Buffer.concat([this.buf, d]);
+      while (this.buf.length >= HEADER) {
+        const n = this.buf.readUInt32BE(8);
+        if (this.buf.length < HEADER + n) break;
+        this.frames.push({ type: this.buf.readUInt16BE(4), rid: this.buf.readBigUInt64BE(12), payload: this.buf.subarray(HEADER, HEADER + n).toString() });
+        this.buf = this.buf.subarray(HEADER + n);
+      }
+      this.wake();
+    });
+    const done = () => { this.closed = true; this.wake(); };
+    this.sock.on('close', done);
+    this.sock.on('error', done);
+  }
+  wake() { this.waiters.splice(0).forEach(w => w()); }
+  ready() { return new Promise((res, rej) => { this.sock.once('connect', res); this.sock.once('error', rej); }); }
+  send(buf) { this.sock.write(buf); }
+  async until(pred, ms = 300000) {
+    const end = Date.now() + ms;
+    for (;;) {
+      const f = this.frames.find(pred);
+      if (f) return f;
+      if (this.closed) return null;
+      if (Date.now() > end) throw new Error('timeout waiting for frame');
+      await new Promise(r => { this.waiters.push(r); setTimeout(r, 200); });
+    }
+  }
+  terminal() { return this.until(f => f.type === T.DONE || f.type === T.ERROR); }
+  close() { this.sock.destroy(); }
+}
+
+async function convert(src, dstDir, rid = 1) { return convertFmt(src, dstDir, "ffpfsc", rid); }
+
+async function convertFmt(src, dstDir, fmt, rid = 1) {
+  const c = new Client();
+  await c.ready();
+  c.send(frame(T.CONVERT, rid, Buffer.from(`${src}\n${dstDir}\n${fmt}`)));
+  const t = await c.terminal();
+  c.close();
+  return t;
+}
+
+async function ping() {
+  const c = new Client(); await c.ready();
+  c.send(frame(T.PING, 1));
+  const r = await c.until(f => f.type === T.PONG);
+  c.close();
+  assert.ok(r, 'daemon must answer PING');
+}
+
+function socketIsLive() {
+  return new Promise(res => {
+    if (!fs.existsSync(SOCK)) return res(false);
+    const c = net.createConnection(SOCK);
+    c.once('connect', () => { c.destroy(); res(true); });
+    c.once('error', () => res(false));
+  });
+}
+
+async function startDaemon(threads) {
+  if (!fs.existsSync(BIN)) throw new Error('build the daemon first: make linux');
+  if (await socketIsLive()) throw new Error('another wfm-ultrapack-helper is already listening on ' + SOCK);
+  try { fs.unlinkSync(SOCK); } catch (_) {}
+  const env = Object.assign({}, process.env, { WUP_THREADS: String(threads) });
+  const p = spawn(BIN, [], { stdio: 'ignore', env });
+  for (let i = 0; i < 50 && !fs.existsSync(SOCK); i++) await new Promise(r => setTimeout(r, 100));
+  if (!fs.existsSync(SOCK)) throw new Error('daemon socket did not appear');
+  return p;
+}
+
+async function stopDaemon(p) {
+  const exited = new Promise(r => p.once('exit', r));
+  p.kill('SIGKILL');
+  await exited;
+  try { fs.unlinkSync(SOCK); } catch (_) {}
+}
+
+const sha256 = f => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+
+// Semi-compressible data: runs of repeated words mixed with random bytes (ratio ~ 0.5).
+function semiData(n, seed) {
+  const b = Buffer.alloc(n);
+  const words = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'];
+  let o = 0, i = seed;
+  while (o < n) {
+    const len = Math.min(n - o, 2048 + (i * 977) % 4096);
+    if (i % 3 === 0) {
+      crypto.randomFillSync(b, o, len);
+    } else {
+      const w = Buffer.from(words[i % words.length] + ' ');
+      for (let k = 0; k < len; k++) b[o + k] = w[k % w.length];
+    }
+    o += len; i++;
+  }
+  return b;
+}
+
+function writeBig(file, mb, seed, mode) {
+  const fd = fs.openSync(file, 'w');
+  for (let i = 0; i < mb; i++) {
+    const chunk = mode === 'random' ? crypto.randomBytes(MB) : mode === 'zero' ? Buffer.alloc(MB) : semiData(MB, seed + i);
+    fs.writeSync(fd, chunk);
+  }
+  fs.closeSync(fd);
+}
+
+function threadCount(pid) {
+  try { return fs.readdirSync(`/proc/${pid}/task`).length; } catch (_) { return -1; }
+}
+
+const results = [];
+async function test(name, fn) {
+  try { await fn(); results.push([name, true]); console.log('  ok   ' + name); }
+  catch (e) { results.push([name, false]); console.log('  FAIL ' + name + '\n       ' + (e.stack || e).toString().split('\n').slice(0, 4).join('\n       ')); }
+}
+
+async function main() {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'wup-mt-'));
+  let daemon = null;
+  try {
+    // ---------- determinism tree (~100 MB mixed, empty file, odd sizes) ----------
+    const tree = path.join(work, 'tree');
+    fs.mkdirSync(path.join(tree, 'sub', 'deep'), { recursive: true });
+    writeBig(path.join(tree, 'compressible.bin'), 30, 1, 'zero');
+    writeBig(path.join(tree, 'semi.bin'), 40, 7, 'semi');
+    writeBig(path.join(tree, 'sub', 'random.bin'), 30, 0, 'random');
+    fs.writeFileSync(path.join(tree, 'empty.dat'), '');
+    for (const n of [1, 511, 4097, 65535, 65536, 65537, 131071, 1000003]) {
+      fs.writeFileSync(path.join(tree, 'sub', 'deep', `odd_${n}.bin`), semiData(n, n));
+    }
+    const tiny = path.join(work, 'tiny'); fs.mkdirSync(tiny);
+    fs.writeFileSync(path.join(tiny, 'a.txt'), 'hello');
+
+    const ref = {};
+    for (const [label, dir] of [['tree', tree], ['tiny', tiny]]) {
+      for (const n of [1, 2, 4, 8]) {
+        await test(`WUP_THREADS=${n}: ${label} output byte-identical to WUP_THREADS=1`, async () => {
+          daemon = await startDaemon(n);
+          try {
+            const out = path.join(work, `out_${label}_${n}`); fs.mkdirSync(out);
+            const r = await convert(dir, out);
+            assert.strictEqual(r.type, T.DONE, r.payload);
+            const files = fs.readdirSync(out);
+            assert.strictEqual(files.length, 1, 'exactly one output file expected: ' + files);
+            const h = sha256(path.join(out, files[0]));
+            if (n === 1) ref[label] = h; else assert.strictEqual(h, ref[label]);
+            await ping();
+          } finally { await stopDaemon(daemon); daemon = null; }
+        });
+      }
+    }
+
+    // ---------- image -> ffpfsc (convert_image_to_ffpfsc) ----------
+    const imgDir = path.join(work, 'imgs'); fs.mkdirSync(imgDir);
+    {
+      daemon = await startDaemon(1);
+      try {
+        const eo = path.join(work, 'exfat_out'); fs.mkdirSync(eo);
+        const r = await convertFmt(tree, eo, 'exfat', 51);
+        assert.strictEqual(r.type, T.DONE, r.payload);
+        fs.copyFileSync(path.join(eo, fs.readdirSync(eo)[0]), path.join(imgDir, 'tree.exfat'));
+      } finally { await stopDaemon(daemon); daemon = null; }
+      writeBig(path.join(imgDir, 'raw.img'), 40, 3, 'random');
+      fs.appendFileSync(path.join(imgDir, 'raw.img'), semiData(12345, 9)); // odd tail
+    }
+    for (const img of ['tree.exfat', 'raw.img']) {
+      const rh = {};
+      for (const n of [1, 2, 4, 8]) {
+        await test(`image ${img} -> ffpfsc: WUP_THREADS=${n} byte-identical to 1`, async () => {
+          daemon = await startDaemon(n);
+          try {
+            const out = path.join(work, `iout_${img}_${n}`); fs.mkdirSync(out);
+            const r = await convert(path.join(imgDir, img), out, 52);
+            assert.strictEqual(r.type, T.DONE, r.payload);
+            const h = sha256(path.join(out, fs.readdirSync(out)[0]));
+            if (n === 1) rh[img] = h; else assert.strictEqual(h, rh[img]);
+          } finally { await stopDaemon(daemon); daemon = null; }
+        });
+      }
+    }
+    await test('image -> ffpfsc (8 threads): PFS image + inner PFSC file inflate to the source image', async () => {
+      daemon = await startDaemon(8);
+      try {
+        const out = path.join(work, 'iparse_out'); fs.mkdirSync(out);
+        const r = await convert(path.join(imgDir, 'raw.img'), out, 55);
+        assert.strictEqual(r.type, T.DONE, r.payload);
+        const p = parseFfpfsc(fs.readFileSync(path.join(out, 'raw.ffpfsc')));
+        assert.strictEqual(p.innerName, 'raw.img');
+        const src = fs.readFileSync(path.join(imgDir, 'raw.img'));
+        assert.strictEqual(p.rawSize, src.length);
+        const inner = p.inflate();
+        assert.ok(inner.subarray(0, src.length).equals(src), 'inner image differs from the source');
+        assert.ok(inner.subarray(src.length).every(x => x === 0), 'padding must be zero');
+      } finally { await stopDaemon(daemon); daemon = null; }
+    });
+    await test('image -> ffpfsc: WUP_THREADS=8 cancel removes the output and the daemon keeps working', async () => {
+      daemon = await startDaemon(8);
+      try {
+        const big = path.join(work, 'cancel.img'); writeBig(big, 300, 0, 'random');
+        const cout = path.join(work, 'icancel_out'); fs.mkdirSync(cout);
+        const c = new Client(); await c.ready();
+        c.send(frame(T.CONVERT, 53, Buffer.from(`${big}
+${cout}
+ffpfsc`)));
+        await c.until(f => f.type === T.PROGRESS && f.rid === 53n);
+        c.send(frame(T.CANCEL, 53));
+        const end = await c.until(f => (f.type === T.ERROR || f.type === T.DONE) && f.rid === 53n);
+        assert.strictEqual(end.type, T.ERROR, 'finished before the cancel landed');
+        assert.match(end.payload, /cancel/i);
+        assert.deepStrictEqual(fs.readdirSync(cout), []);
+        c.close();
+        await ping();
+        fs.unlinkSync(big);
+      } finally { await stopDaemon(daemon); daemon = null; }
+    });
+    await test('image -> ffpfsc speed: 8 threads vs 1 thread', async () => {
+      if (SANITIZED) { console.log('       (speed test skipped under sanitizers)'); return; }
+      const mb = parseInt(process.env.MT_SPEED_MB || '600', 10);
+      const big = path.join(imgDir, 'speed.img');
+      writeBig(big, mb, 5000, 'semi');
+      const rate = {}; let h1 = null;
+      for (const n of [1, 8]) {
+        daemon = await startDaemon(n);
+        try {
+          const out = path.join(work, `ispeed_${n}`); fs.mkdirSync(out);
+          const t0 = process.hrtime.bigint();
+          const r = await convert(big, out, 54);
+          const sec = Number(process.hrtime.bigint() - t0) / 1e9;
+          assert.strictEqual(r.type, T.DONE, r.payload);
+          rate[n] = mb / sec;
+          console.log(`       image threads=${n}: ${sec.toFixed(2)} s, ${rate[n].toFixed(1)} MB/s`);
+          const h = sha256(path.join(out, fs.readdirSync(out)[0]));
+          if (n === 1) h1 = h; else assert.strictEqual(h, h1);
+          fs.rmSync(out, { recursive: true, force: true });
+        } finally { await stopDaemon(daemon); daemon = null; }
+      }
+      const ratio = rate[8] / rate[1];
+      console.log(`       image speedup 8 vs 1: ${ratio.toFixed(2)}x (${os.cpus().length} CPUs)`);
+      if (!SANITIZED && os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x, got ${ratio.toFixed(2)}x`);
+      fs.unlinkSync(big);
+    });
+
+    // ---------- cancel with 8 threads ----------
+    await test('WUP_THREADS=8: cancel mid-stream leaves no output, no leaked threads, daemon still works', async () => {
+      daemon = await startDaemon(8);
+      try {
+        const base = threadCount(daemon.pid);
+        const ct = path.join(work, 'canceltree'); fs.mkdirSync(ct);
+        for (let i = 0; i < 4; i++) writeBig(path.join(ct, `r${i}.bin`), 60, i * 100, 'random');
+        const cout = path.join(work, 'cancel_out'); fs.mkdirSync(cout);
+        const c = new Client(); await c.ready();
+        c.send(frame(T.CONVERT, 31, Buffer.from(`${ct}\n${cout}\nffpfsc`)));
+        await c.until(f => f.type === T.PROGRESS && f.rid === 31n);
+        c.send(frame(T.CANCEL, 31));
+        const end = await c.until(f => (f.type === T.ERROR || f.type === T.DONE) && f.rid === 31n);
+        assert.strictEqual(end.type, T.ERROR, 'conversion finished before the cancel landed');
+        assert.match(end.payload, /cancel/i);
+        assert.deepStrictEqual(fs.readdirSync(cout), [], 'cancel must leave no partial output');
+        c.close();
+        await ping();
+        // worker threads must be joined: thread count returns to idle level (client threads may linger briefly)
+        let n = -1;
+        for (let i = 0; i < 30; i++) { n = threadCount(daemon.pid); if (n <= base + 1) break; await new Promise(r => setTimeout(r, 100)); }
+        assert.ok(n <= base + 1, `leaked threads after cancel: ${n} (idle ${base})`);
+        const r = await convert(tiny, cout, 32);
+        assert.strictEqual(r.type, T.DONE, r.payload);
+        fs.rmSync(ct, { recursive: true, force: true });
+      } finally { await stopDaemon(daemon); daemon = null; }
+    });
+
+    // ---------- speed ----------
+    await test('speed: 8 threads vs 1 thread', async () => {
+      if (SANITIZED) { console.log('       (speed test skipped under sanitizers)'); return; }
+      const mb = parseInt(process.env.MT_SPEED_MB || '600', 10);
+      const big = path.join(work, 'bigtree'); fs.mkdirSync(big);
+      const per = 100;
+      for (let i = 0; i < Math.ceil(mb / per); i++) writeBig(path.join(big, `s${i}.bin`), Math.min(per, mb - i * per), i * 1000, 'semi');
+      const rate = {};
+      let hash1 = null;
+      for (const n of [1, 8]) {
+        daemon = await startDaemon(n);
+        try {
+          const out = path.join(work, `speed_out_${n}`); fs.mkdirSync(out);
+          const t0 = process.hrtime.bigint();
+          const r = await convert(big, out, 41);
+          const sec = Number(process.hrtime.bigint() - t0) / 1e9;
+          assert.strictEqual(r.type, T.DONE, r.payload);
+          rate[n] = mb / sec;
+          console.log(`       threads=${n}: ${sec.toFixed(2)} s, ${rate[n].toFixed(1)} MB/s`);
+          const h = sha256(path.join(out, fs.readdirSync(out)[0]));
+          if (n === 1) hash1 = h; else assert.strictEqual(h, hash1, 'speed-test outputs differ');
+          fs.rmSync(out, { recursive: true, force: true });
+        } finally { await stopDaemon(daemon); daemon = null; }
+      }
+      const ratio = rate[8] / rate[1];
+      console.log(`       speedup 8 vs 1: ${ratio.toFixed(2)}x (${os.cpus().length} CPUs)`);
+      if (!SANITIZED && os.cpus().length >= 8) assert.ok(ratio >= 2.5, `expected >= 2.5x speedup, got ${ratio.toFixed(2)}x`);
+      else console.log('       (fewer than 8 CPUs: speedup assertion skipped)');
+      fs.rmSync(big, { recursive: true, force: true });
+    });
+  } finally {
+    if (daemon) { try { await stopDaemon(daemon); } catch (_) {} }
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+  const failed = results.filter(r => !r[1]).length;
+  console.log(`\n${results.length - failed}/${results.length} passed`);
+  process.exit(failed ? 1 : 0);
+}
+
+main().catch(e => { console.error(e); process.exit(1); });

@@ -20,6 +20,17 @@ static void handle_signal(int sig) {
   g_running = 0;
 }
 
+/* is_busy / cancel_requested are shared between the client thread and the conversion worker.
+ * Release/acquire gives the worker's last use of the context a happens-before edge to teardown. */
+#define FLAG_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define FLAG_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+
+/* Volatile stores so the compiler cannot elide the wipe of secrets (passcodes). */
+static void scrub_bytes(void *p, size_t n) {
+  volatile unsigned char *v = (volatile unsigned char *)p;
+  while (n--) *v++ = 0;
+}
+
 typedef struct client_context {
   int fd;
   pthread_mutex_t send_lock;
@@ -141,6 +152,7 @@ typedef struct worker_job {
   char source[4096];
   char destination[4096];
   char format[64];
+  char passcode[64];   /* optional PKG passcode; never logged or echoed */
   uint64_t request_id;
 } worker_job_t;
 
@@ -161,7 +173,7 @@ static void on_convert_progress(uint64_t total, uint64_t done, void *user_data) 
 
 static bool check_cancel(void *user_data) {
   worker_job_t *job = (worker_job_t *)user_data;
-  return job->ctx->cancel_requested;
+  return FLAG_LOAD(&job->ctx->cancel_requested);
 }
 
 static bool is_safe_path(const char *path) {
@@ -180,13 +192,29 @@ static bool is_safe_path(const char *path) {
   return false;
 }
 
+/* Socket path: WUP_SOCKET overrides the default on Linux (tests, parallel runs). */
+static const char *sock_path(void) {
+#ifdef __linux__
+  const char *e = getenv("WUP_SOCKET");
+  if (e && *e) return e;
+#endif
+  return WUP_HELPER_SOCKET;
+}
+
 static void *conversion_worker_thread(void *arg) {
   worker_job_t *job = (worker_job_t *)arg;
   char err_msg[1024] = {0};
 
-  int ret = run_conversion(job->source, job->destination, job->format,
+  int ret = run_conversion_ex(job->source, job->destination, job->format,
+                           job->passcode[0] ? job->passcode : NULL,
                            on_convert_progress, check_cancel,
                            job, err_msg, sizeof(err_msg));
+
+  /* Volatile stores prevent the compiler from removing the passcode wipe. */
+  volatile unsigned char *passcode_bytes = (volatile unsigned char *)job->passcode;
+  for (size_t i = 0; i < sizeof(job->passcode); i++) {
+    passcode_bytes[i] = 0;
+  }
 
   if (ret == 0) {
     send_frame_locked(job->ctx, WUP_MSG_DONE, job->request_id, NULL, 0);
@@ -195,7 +223,7 @@ static void *conversion_worker_thread(void *arg) {
     send_frame_locked(job->ctx, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
   }
 
-  job->ctx->is_busy = false;
+  FLAG_STORE(&job->ctx->is_busy, false);
   free(job);
   return NULL;
 }
@@ -223,6 +251,7 @@ handle_client(void *arg) {
   ctx->is_busy = false;
   ctx->last_progress_time_ms = 0;
   pthread_t worker_tid = 0;
+  bool have_worker = false;
 
   while (g_running) {
     int ret = recv_frame(fd, &frame, &payload, &payload_cap);
@@ -231,13 +260,14 @@ handle_client(void *arg) {
     if (frame.type == WUP_MSG_PING) {
       send_frame_locked(ctx, WUP_MSG_PONG, frame.request_id, NULL, 0);
     } else if (frame.type == WUP_MSG_STATUS) {
-      const char *st = ctx->is_busy ? "busy" : "idle";
+      const char *st = FLAG_LOAD(&ctx->is_busy) ? "busy" : "idle";
       send_frame_locked(ctx, WUP_MSG_STATUS, frame.request_id, st, (uint32_t)strlen(st));
     } else if (frame.type == WUP_MSG_CANCEL) {
-      ctx->cancel_requested = true;
+      FLAG_STORE(&ctx->cancel_requested, true);
     } else if (frame.type == WUP_MSG_CONVERT) {
-      if (ctx->is_busy) {
+      if (FLAG_LOAD(&ctx->is_busy)) {
         const char *err = "Conversion already in progress";
+        scrub_bytes(payload, frame.payload_size);
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -256,13 +286,25 @@ handle_client(void *arg) {
       char *second_nl = strchr(rem, '\n');
       char *dst_path = rem;
       char *fmt_str = "ffpfsc";
+      char *passcode = "";
       if (second_nl) {
         *second_nl = '\0';
         fmt_str = second_nl + 1;
+        char *third_nl = strchr(fmt_str, '\n');
+        if (third_nl) {
+          *third_nl = '\0';
+          passcode = third_nl + 1;
+        }
       }
+      /* Keep the passcode only in a local copy; wipe the receive buffer now so no rejection or
+       * allocation-failure path below can leave it behind. */
+      char pc[64];
+      snprintf(pc, sizeof(pc), "%s", passcode);
+      scrub_bytes(passcode, strlen(passcode));
 
       if (!is_safe_path(src_path) || !is_safe_path(dst_path)) {
         const char *err = "Invalid or disallowed path";
+        scrub_bytes(pc, sizeof(pc));
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -270,6 +312,7 @@ handle_client(void *arg) {
       worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
       if (!job) {
         const char *err = "Out of memory";
+        scrub_bytes(pc, sizeof(pc));
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
         continue;
       }
@@ -279,9 +322,16 @@ handle_client(void *arg) {
       strncpy(job->source, src_path, sizeof(job->source) - 1);
       strncpy(job->destination, dst_path, sizeof(job->destination) - 1);
       strncpy(job->format, fmt_str, sizeof(job->format) - 1);
+      snprintf(job->passcode, sizeof(job->passcode), "%s", pc);
+      scrub_bytes(pc, sizeof(pc));
 
-      ctx->cancel_requested = false;
-      ctx->is_busy = true;
+      /* join the previous (finished) worker so its thread resources are released */
+      if (have_worker) {
+        pthread_join(worker_tid, NULL);
+        have_worker = false;
+      }
+      FLAG_STORE(&ctx->cancel_requested, false);
+      FLAG_STORE(&ctx->is_busy, true);
       ctx->last_progress_time_ms = 0;
       send_frame_locked(ctx, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
@@ -292,12 +342,14 @@ handle_client(void *arg) {
 
       if (pthread_create(&worker_tid, &attr, conversion_worker_thread, job) != 0) {
         pthread_attr_destroy(&attr);
-        ctx->is_busy = false;
+        FLAG_STORE(&ctx->is_busy, false);
+        scrub_bytes(job->passcode, sizeof(job->passcode));
         free(job);
         const char *err = "Failed to spawn conversion thread";
         send_frame_locked(ctx, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
       } else {
         pthread_attr_destroy(&attr);
+        have_worker = true;
       }
     } else {
       /* Unknown frame type */
@@ -307,8 +359,8 @@ handle_client(void *arg) {
   }
 
   /* If client disconnected mid-task, cancel active worker and join it */
-  ctx->cancel_requested = true;
-  if (ctx->is_busy) {
+  FLAG_STORE(&ctx->cancel_requested, true);
+  if (have_worker) {
     pthread_join(worker_tid, NULL);
   }
 
@@ -322,6 +374,12 @@ handle_client(void *arg) {
 int main(void) {
   int server_fd;
   struct sockaddr_un addr;
+  const char *path = sock_path();
+
+  if (strlen(path) >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "socket path too long (max %zu): %s\n", sizeof(addr.sun_path) - 1, path);
+    return 1;
+  }
 
   /* Prevent process termination when writing to closed sockets */
   signal(SIGPIPE, SIG_IGN);
@@ -339,7 +397,7 @@ int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
   }
 
-  unlink(WUP_HELPER_SOCKET);
+  unlink(path);
   server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (server_fd < 0) {
     perror("socket");
@@ -348,7 +406,7 @@ int main(void) {
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, WUP_HELPER_SOCKET, sizeof(addr.sun_path) - 1);
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 #ifndef __linux__
   addr.sun_len = (unsigned char)SUN_LEN(&addr);
   socklen_t addr_len = addr.sun_len;
@@ -362,7 +420,7 @@ int main(void) {
     return 1;
   }
 
-  chmod(WUP_HELPER_SOCKET, 0770);
+  chmod(path, 0770);
 
   if (listen(server_fd, 8) < 0) {
     perror("listen");
@@ -370,7 +428,7 @@ int main(void) {
     return 1;
   }
 
-  printf("wfm-ultrapack-helper listening on %s\n", WUP_HELPER_SOCKET);
+  printf("wfm-ultrapack-helper listening on %s\n", path);
 
   while (g_running) {
     int client_fd = accept(server_fd, NULL, NULL);
@@ -384,7 +442,7 @@ int main(void) {
   }
 
   close(server_fd);
-  unlink(WUP_HELPER_SOCKET);
+  unlink(path);
   if (log_fp) fclose(log_fp);
   return 0;
 }

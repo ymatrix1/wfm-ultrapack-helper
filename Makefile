@@ -1,13 +1,20 @@
 BIN := wfm-ultrapack-helper.elf
 LINUX_BIN := wfm-ultrapack-helper-linux
 
-SRCS := src/main.c src/exfat_engine.c src/convert_engine.c src/miniz.c
+SRCS := src/main.c src/exfat_engine.c src/convert_engine.c src/miniz.c src/crypto.c src/rsa.c src/pkg_reader.c src/fih_reader.c src/kraken.c
 OBJS := $(SRCS:.c=.o)
 LINUX_OBJS := $(SRCS:.c=.linux.o)
 
 HOST_CC ?= cc
 CFLAGS := -O2 -Wall -Wextra -pthread -Isrc
 LDFLAGS := -pthread
+
+# Sanitizer builds: make linux SAN=address,undefined   or   make linux SAN=thread
+SAN ?=
+ifneq ($(SAN),)
+CFLAGS += -fsanitize=$(SAN) -fno-omit-frame-pointer -g
+LDFLAGS += -fsanitize=$(SAN)
+endif
 
 # If PS5_PAYLOAD_SDK is set, include prospero.mk for ps5 or default goals
 ifdef PS5_PAYLOAD_SDK
