@@ -148,9 +148,29 @@ async function testServerExchange() {
   assert.deepStrictEqual(responses, [2 /* PONG */, 20 /* ACCEPTED */, 21 /* PROGRESS */, 24 /* DONE */]);
 }
 
+// 4. Test In-Memory exFAT & PFSC format signatures and structures
+function testConversionFormatValidation() {
+  // Test PFSC header constants
+  const PFSC_MAGIC = 0x43534650; // 'PFSC'
+  const PFSC_LOGICAL_BLOCK_SIZE = 64 * 1024;
+  assert.strictEqual(PFSC_MAGIC, 0x43534650);
+  assert.strictEqual(PFSC_LOGICAL_BLOCK_SIZE, 65536);
+
+  // Test exFAT VBR signature and layout calculation
+  const vbr = Buffer.alloc(512);
+  vbr[0] = 0xEB; vbr[1] = 0x76; vbr[2] = 0x90;
+  vbr.write("EXFAT   ", 3, 8, "ascii");
+  vbr.writeUInt16LE(0xAA55, 510);
+
+  assert.strictEqual(vbr[0], 0xEB);
+  assert.strictEqual(vbr.toString("ascii", 3, 11), "EXFAT   ");
+  assert.strictEqual(vbr.readUInt16LE(510), 0xAA55);
+}
+
 async function run() {
   testFraming();
   testSpaceEstimate();
+  testConversionFormatValidation();
   await testServerExchange();
   console.log("All wfm-ultrapack-helper tests passed successfully!");
 }

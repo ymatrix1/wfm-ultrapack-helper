@@ -1,11 +1,11 @@
 BIN := wfm-ultrapack-helper.elf
 LINUX_BIN := wfm-ultrapack-helper-linux
 
-SRCS := src/main.c
+SRCS := src/main.c src/exfat_engine.c src/convert_engine.c
 
 HOST_CC ?= cc
 CFLAGS := -O2 -Wall -Wextra -pthread -Isrc
-LDFLAGS := -pthread
+LDFLAGS := -pthread -lz
 
 ifneq ($(filter-out linux clean,$(MAKECMDGOALS)),)
   ifdef PS5_PAYLOAD_SDK
