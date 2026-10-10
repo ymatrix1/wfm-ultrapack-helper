@@ -10,8 +10,15 @@
 #include <pthread.h>
 
 #include "protocol.h"
+#include "convert_engine.h"
 
 static int g_running = 1;
+
+typedef struct client_context {
+  int fd;
+  uint64_t request_id;
+  volatile bool cancel_requested;
+} client_context_t;
 
 static void
 put16(unsigned char *p, uint16_t v) {
@@ -91,35 +98,105 @@ recv_frame(int fd, wup_frame_t *frame, char *payload, size_t cap) {
   return 1;
 }
 
+static void on_convert_progress(uint64_t total, uint64_t done, void *user_data) {
+  client_context_t *ctx = (client_context_t *)user_data;
+  unsigned char prog[16];
+  put64(prog, total);
+  put64(prog + 8, done);
+  send_frame(ctx->fd, WUP_MSG_PROGRESS, ctx->request_id, prog, sizeof(prog));
+}
+
+static bool check_cancel(void *user_data) {
+  client_context_t *ctx = (client_context_t *)user_data;
+  return ctx->cancel_requested;
+}
+
+typedef struct worker_job {
+  client_context_t *ctx;
+  char source[2048];
+  char destination[2048];
+  char format[64];
+  uint64_t request_id;
+} worker_job_t;
+
+static void *conversion_worker_thread(void *arg) {
+  worker_job_t *job = (worker_job_t *)arg;
+  char err_msg[1024] = {0};
+
+  int ret = run_conversion(job->source, job->destination, job->format,
+                           on_convert_progress, check_cancel,
+                           job->ctx, err_msg, sizeof(err_msg));
+
+  if (ret == 0) {
+    send_frame(job->ctx->fd, WUP_MSG_DONE, job->request_id, NULL, 0);
+  } else {
+    const char *resp = err_msg[0] ? err_msg : "Conversion failed";
+    send_frame(job->ctx->fd, WUP_MSG_ERROR, job->request_id, resp, (uint32_t)strlen(resp));
+  }
+
+  free(job);
+  return NULL;
+}
+
 static void *
 handle_client(void *arg) {
   int fd = (int)(intptr_t)arg;
   wup_frame_t frame;
   char payload[8192];
+  memset(&frame, 0, sizeof(frame));
+  memset(payload, 0, sizeof(payload));
+  client_context_t ctx;
+  ctx.fd = fd;
+  ctx.request_id = 0;
+  ctx.cancel_requested = false;
+  pthread_t worker_tid = 0;
 
   while (g_running) {
     int ret = recv_frame(fd, &frame, payload, sizeof(payload));
     if (ret <= 0) break;
 
+    ctx.request_id = frame.request_id;
+
     if (frame.type == WUP_MSG_PING) {
       send_frame(fd, WUP_MSG_PONG, frame.request_id, NULL, 0);
+    } else if (frame.type == WUP_MSG_CANCEL) {
+      ctx.cancel_requested = true;
     } else if (frame.type == WUP_MSG_CONVERT) {
-      /* Conversion request handling */
+      /* Reset cancellation for fresh job */
+      ctx.cancel_requested = false;
       send_frame(fd, WUP_MSG_ACCEPTED, frame.request_id, NULL, 0);
 
-      /* Stream simulated or actual conversion stages */
-      unsigned char prog[16];
-      uint64_t total = 100;
-      uint64_t done = 100;
-      put64(prog, total);
-      put64(prog + 8, done);
-      send_frame(fd, WUP_MSG_PROGRESS, frame.request_id, prog, sizeof(prog));
+      worker_job_t *job = (worker_job_t *)calloc(1, sizeof(worker_job_t));
+      if (!job) {
+        const char *err = "Out of memory";
+        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+        continue;
+      }
 
-      /* Done */
-      send_frame(fd, WUP_MSG_DONE, frame.request_id, NULL, 0);
+      job->ctx = &ctx;
+      job->request_id = frame.request_id;
+      strncpy(job->format, "ffpfsc", sizeof(job->format) - 1);
+
+      char *line1 = strtok(payload, "\n");
+      char *line2 = strtok(NULL, "\n");
+      char *line3 = strtok(NULL, "\n");
+
+      if (line1) strncpy(job->source, line1, sizeof(job->source) - 1);
+      if (line2) strncpy(job->destination, line2, sizeof(job->destination) - 1);
+      if (line3) strncpy(job->format, line3, sizeof(job->format) - 1);
+
+      if (pthread_create(&worker_tid, NULL, conversion_worker_thread, job) != 0) {
+        free(job);
+        const char *err = "Failed to spawn conversion thread";
+        send_frame(fd, WUP_MSG_ERROR, frame.request_id, err, (uint32_t)strlen(err));
+      } else {
+        pthread_detach(worker_tid);
+      }
     }
   }
 
+  /* Wait for or cancel any active worker */
+  ctx.cancel_requested = true;
   close(fd);
   return NULL;
 }
