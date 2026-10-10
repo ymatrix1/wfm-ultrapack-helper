@@ -32,6 +32,14 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
   uint64_t total_input_size = (uint64_t)st.st_size;
   uint32_t block_count = (uint32_t)((total_input_size + PFSC_LOGICAL_BLOCK_SIZE - 1) / PFSC_LOGICAL_BLOCK_SIZE);
+  uint64_t logical_size = (uint64_t)block_count * PFSC_LOGICAL_BLOCK_SIZE;
+
+  /* Dynamically size initial data offset so table never overflows */
+  size_t table_bytes = (size_t)(block_count + 1) * sizeof(uint64_t);
+  uint64_t initial_data_offset = PFSC_INITIAL_DATA_OFFSET;
+  while (initial_data_offset < PFSC_BLOCK_OFFSETS_OFFSET + table_bytes) {
+    initial_data_offset += PFSC_LOGICAL_BLOCK_SIZE;
+  }
 
   FILE *fout = fopen(out_ffpfsc_path, "wb+");
   if (!fout) {
@@ -42,7 +50,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
 
   /* 1. Reserve PFSC header and block offsets */
   uint8_t zero_buf[4096] = {0};
-  size_t header_pad = PFSC_INITIAL_DATA_OFFSET;
+  size_t header_pad = (size_t)initial_data_offset;
   while (header_pad > 0) {
     size_t p = (header_pad > sizeof(zero_buf)) ? sizeof(zero_buf) : header_pad;
     if (fwrite(zero_buf, 1, p, fout) != p) {
@@ -62,7 +70,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     return -1;
   }
 
-  uint64_t current_out_offset = PFSC_INITIAL_DATA_OFFSET;
+  uint64_t current_out_offset = initial_data_offset;
   uint8_t in_buf[PFSC_LOGICAL_BLOCK_SIZE];
   uint8_t out_buf[PFSC_LOGICAL_BLOCK_SIZE * 2];
 
@@ -79,6 +87,11 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     size_t nread = fread(in_buf, 1, sizeof(in_buf), fin);
     if (nread == 0) break;
 
+    /* If partial block, zero-pad remainder so logical block is always 64 KiB */
+    if (nread < sizeof(in_buf)) {
+      memset(in_buf + nread, 0, sizeof(in_buf) - nread);
+    }
+
     offsets[b] = current_out_offset;
 
     /* Compress block via zlib */
@@ -91,7 +104,7 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
       return -1;
     }
 
-    strm.avail_in = (uInt)nread;
+    strm.avail_in = sizeof(in_buf);
     strm.next_in = in_buf;
     strm.avail_out = sizeof(out_buf);
     strm.next_out = out_buf;
@@ -100,14 +113,14 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
     size_t comp_sz = sizeof(out_buf) - strm.avail_out;
     deflateEnd(&strm);
 
-    if (ret != Z_STREAM_END || comp_sz >= nread) {
-      /* Store uncompressed block directly if compression didn't shrink it */
-      if (fwrite(in_buf, 1, nread, fout) != nread) {
+    if (ret != Z_STREAM_END || comp_sz >= sizeof(in_buf)) {
+      /* Store uncompressed block directly as a full 64 KiB block */
+      if (fwrite(in_buf, 1, sizeof(in_buf), fout) != sizeof(in_buf)) {
         free(offsets); fclose(fin); fclose(fout);
         unlink(out_ffpfsc_path);
         return -1;
       }
-      current_out_offset += nread;
+      current_out_offset += sizeof(in_buf);
     } else {
       if (fwrite(out_buf, 1, comp_sz, fout) != comp_sz) {
         free(offsets); fclose(fin); fclose(fout);
@@ -127,14 +140,16 @@ int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_pa
   uint8_t hdr[PFSC_HEADER_SIZE];
   memset(hdr, 0, sizeof(hdr));
   hdr[0] = 'P'; hdr[1] = 'F'; hdr[2] = 'S'; hdr[3] = 'C'; /* 0x43534650 */
-  /* unk4 = 0, unk8 = 6 */
   hdr[8] = 6;
   /* Logical block size */
   hdr[16] = 0; hdr[17] = 0; hdr[18] = 1; hdr[19] = 0; /* 0x10000 = 64 KiB LE */
+  hdr[20] = 0; hdr[21] = 0; hdr[22] = 1; hdr[23] = 0;
   /* Block count */
-  memcpy(hdr + 20, &block_count, 4);
-  /* Uncompressed size */
-  memcpy(hdr + 24, &total_input_size, 8);
+  uint32_t boff_ptr = PFSC_BLOCK_OFFSETS_OFFSET;
+  uint32_t data_off_ptr = (uint32_t)initial_data_offset;
+  memcpy(hdr + 24, &boff_ptr, 4);
+  memcpy(hdr + 28, &data_off_ptr, 4);
+  memcpy(hdr + 32, &logical_size, 8);
 
   fseek(fout, 0, SEEK_SET);
   fwrite(hdr, 1, sizeof(hdr), fout);
