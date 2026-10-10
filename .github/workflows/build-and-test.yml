@@ -30,9 +30,18 @@ jobs:
         run: |
           make linux
 
+      - name: Install exfatprogs (exFAT validation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y exfatprogs
+
       - name: Run Protocol & Integration Tests
         run: |
           node tests/protocol-test.js
+
+      - name: Run End-to-End Daemon Tests
+        run: |
+          node tests/e2e-test.js
 
   build-ps5:
     name: Build PS5 ELF

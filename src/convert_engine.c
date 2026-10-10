@@ -21,6 +21,7 @@ static void put64_le(uint8_t *p, uint64_t v) {
 
 typedef struct progress_envelope {
   convert_progress_cb user_cb;
+  convert_cancel_cb cancel_cb;
   void *user_data;
   double scale;
   double offset;
@@ -35,6 +36,13 @@ static void wrapped_progress(uint64_t total, uint64_t done, void *user_data) {
   uint64_t report_done = (uint64_t)((env->offset + ratio * env->scale) * (double)report_total);
   if (report_done > report_total) report_done = report_total;
   env->user_cb(report_total, report_done, env->user_data);
+}
+
+/* cancel_cb receives the same user_data as the stage callbacks (the envelope),
+ * so forward to the caller's cancel callback with the caller's user_data. */
+static bool wrapped_cancel(void *user_data) {
+  progress_envelope_t *env = (progress_envelope_t *)user_data;
+  return env && env->cancel_cb && env->cancel_cb(env->user_data);
 }
 
 int convert_image_to_ffpfsc(const char *in_image_path, const char *out_ffpfsc_path,
@@ -293,16 +301,16 @@ int run_conversion(const char *source_path, const char *dest_path, const char *f
       char temp_exfat[4096];
       snprintf(temp_exfat, sizeof(temp_exfat), "%s/%s.tmp.exfat", dest_path, clean_name);
 
-      progress_envelope_t stage1_env = { progress_cb, user_data, 0.50, 0.00, 1000000 };
-      int ret = convert_folder_to_exfat(sanitized_source, temp_exfat, wrapped_progress, cancel_cb,
+      progress_envelope_t stage1_env = { progress_cb, cancel_cb, user_data, 0.50, 0.00, 1000000 };
+      int ret = convert_folder_to_exfat(sanitized_source, temp_exfat, wrapped_progress, wrapped_cancel,
                                         &stage1_env, err_msg, err_len);
       if (ret != 0) {
         unlink(temp_exfat);
         return ret;
       }
 
-      progress_envelope_t stage2_env = { progress_cb, user_data, 0.50, 0.50, 1000000 };
-      ret = convert_image_to_ffpfsc(temp_exfat, target_file, wrapped_progress, cancel_cb,
+      progress_envelope_t stage2_env = { progress_cb, cancel_cb, user_data, 0.50, 0.50, 1000000 };
+      ret = convert_image_to_ffpfsc(temp_exfat, target_file, wrapped_progress, wrapped_cancel,
                                     &stage2_env, err_msg, err_len);
       unlink(temp_exfat);
       return ret;

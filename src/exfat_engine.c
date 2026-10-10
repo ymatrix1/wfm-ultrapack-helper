@@ -427,6 +427,24 @@ static int write_tree_content(FILE *fout, const exfat_file_node_t *dir,
   return 0;
 }
 
+/* Link `count` contiguous clusters starting at `first` into a FAT chain. */
+static void fat_chain(uint8_t *fat, uint32_t first, uint32_t count) {
+  if (!count) return;
+  for (uint32_t i = 0; i + 1 < count; i++) {
+    put32_le(fat + (size_t)(first + i) * 4, first + i + 1);
+  }
+  put32_le(fat + (size_t)(first + count - 1) * 4, FAT_ENTRY_EOC);
+}
+
+static void fat_walk_chains(uint8_t *fat, const exfat_file_node_t *n) {
+  if (n->first_cluster >= 2 && n->cluster_count > 0) {
+    fat_chain(fat, n->first_cluster, n->cluster_count);
+  }
+  for (size_t i = 0; i < n->child_count; i++) {
+    fat_walk_chains(fat, n->children[i]);
+  }
+}
+
 int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
                             convert_progress_cb progress_cb, convert_cancel_cb cancel_cb,
                             void *user_data, char *err_msg, size_t err_len) {
@@ -539,6 +557,9 @@ int convert_folder_to_exfat(const char *source_dir, const char *out_image_path,
   if (!fat) { fclose(fout); free_exfat_tree(root); unlink(out_image_path); return -1; }
   put32_le(fat + 0, FAT_ENTRY_MEDIA);
   put32_le(fat + 4, FAT_ENTRY_EOC);
+  fat_chain(fat, BITMAP_FIRST_CLUSTER, bitmap_clusters);
+  fat_chain(fat, BITMAP_FIRST_CLUSTER + bitmap_clusters, upcase_clusters);
+  fat_walk_chains(fat, root);
 
   if (fwrite(fat, 1, fat_bytes, fout) != fat_bytes) {
     snprintf(err_msg, err_len, "Failed writing FAT");
